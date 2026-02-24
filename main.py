@@ -1,17 +1,15 @@
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from datetime import timedelta
 
-import numpy as np
 import pandas as pd
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-
 from sklearn.ensemble import RandomForestRegressor
 
 
 # =========================
-# ML FUNCTIONS
+# ML FEATURES
 # =========================
 
 FEATURES = [
@@ -22,6 +20,67 @@ FEATURES = [
     "cumsum_7",
 ]
 
+
+# =========================
+# HEURISTIC (V2) HELPERS
+# =========================
+
+def _daily_series(df: pd.DataFrame) -> pd.Series:
+    """date -> total amount for that day (only days with data)."""
+    return df.groupby("date")["amount"].sum().sort_index()
+
+
+def _avg_calendar_window(daily: pd.Series, anchor: pd.Timestamp, window_days: int) -> float:
+    """
+    Average over last N CALENDAR days ending at anchor (includes 0-spend days).
+    Anchor is based on latest transaction date, not today.
+    """
+    if window_days <= 0 or daily is None or daily.empty:
+        return 0.0
+
+    anchor = pd.Timestamp(anchor).normalize()
+    idx = pd.date_range(anchor - pd.Timedelta(days=window_days - 1), anchor, freq="D")
+    filled = daily.reindex(idx, fill_value=0.0)
+    return float(filled.mean())
+
+
+def heuristic_v2_from_daily(daily: pd.Series) -> Tuple[float, float, float]:
+    """
+    Your rules:
+      1) Only 1 day => x, x*7, x*30
+      2) 2..6 days => avg(days_with_data) * 7/30
+      3) >=7 days => avg(last 7 calendar days, incl 0s) => day=avg7, week=avg7*7
+      4) month => if >=30 days => avg(last 30 calendar days, incl 0s)*30 else avg7*30
+    """
+    if daily is None or daily.empty:
+        return 0.0, 0.0, 0.0
+
+    unique_days = int(daily.index.nunique())
+    total = float(daily.sum())
+    anchor = daily.index.max()
+
+    # 1) Only 1 day of data
+    if unique_days == 1:
+        x = float(daily.iloc[0])
+        return round(x, 2), round(x * 7, 2), round(x * 30, 2)
+
+    # 2) 2..6 days: average over days WITH data
+    if unique_days < 7:
+        avg = total / unique_days
+        return round(avg, 2), round(avg * 7, 2), round(avg * 30, 2)
+
+    # 3) >=7 days: last 7 CALENDAR days average (includes zeros)
+    avg7 = _avg_calendar_window(daily, anchor, 7)
+
+    # 4) month: if >=30 unique days use last 30 CALENDAR avg, else use avg7
+    avg30 = _avg_calendar_window(daily, anchor, 30) if unique_days >= 30 else avg7
+
+    return round(avg7, 2), round(avg7 * 7, 2), round(avg30 * 30, 2)
+
+
+# =========================
+# ML PIPELINE
+# =========================
 
 def aggregate_expenses(df: pd.DataFrame):
     """
@@ -75,7 +134,7 @@ def aggregate_expenses(df: pd.DataFrame):
 
     series_df = series_df.dropna()
 
-    # need some history
+    # need some history after feature engineering
     if len(series_df) < 10:
         return pd.DataFrame(), "No data."
 
@@ -86,7 +145,6 @@ def train_random_forest(series_df: pd.DataFrame):
     X = series_df[FEATURES].copy()
     y = series_df["daily_expense"].astype(float)
 
-    # ✅ lighter + faster (Render friendly)
     model = RandomForestRegressor(
         n_estimators=120,
         max_depth=10,
@@ -117,7 +175,7 @@ def _make_feature_row(temp_df: pd.DataFrame, d: pd.Timestamp) -> dict:
     }
 
 
-def predict_future(model, series_df, days=30):
+def predict_future(model, series_df: pd.DataFrame, days: int = 30) -> pd.DataFrame:
     if series_df is None or series_df.empty:
         return pd.DataFrame(columns=["daily_expense_pred"])
 
@@ -143,7 +201,8 @@ def predict_future(model, series_df, days=30):
 def predict_all_horizons_multi(transactions_df: pd.DataFrame, days: int = 30):
     """
     Returns: (message, next_day, next_week, next_month)
-    ✅ Enforces last 6 months, but falls back if too little data.
+    ✅ Enforces last 6 months (based on latest date in payload), falls back if too little.
+    ✅ Heuristic V2 fallback (your rules) is done in API (Flutter does nothing).
     """
     if transactions_df is None or transactions_df.empty:
         return "No expense data available.", 0.0, 0.0, 0.0
@@ -163,7 +222,7 @@ def predict_all_horizons_multi(transactions_df: pd.DataFrame, days: int = 30):
     if raw.empty or float(raw["amount"].sum()) == 0.0:
         return "No expense data available.", 0.0, 0.0, 0.0
 
-    # ✅ enforce last 6 months based on latest date in payload
+    # ✅ last 6 months window based on latest date in payload
     latest = raw["date"].max()
     cutoff = latest - pd.DateOffset(months=6)
     df6 = raw[raw["date"] >= cutoff]
@@ -171,35 +230,37 @@ def predict_all_horizons_multi(transactions_df: pd.DataFrame, days: int = 30):
     # fallback if too small
     df = df6 if len(df6) >= 10 else raw
 
-    daily = df.groupby("date")["amount"].sum().sort_index()
+    # ✅ heuristic V2 fallback (always available)
+    daily = _daily_series(df)
+    fallback_day, fallback_week, fallback_month = heuristic_v2_from_daily(daily)
 
-    # ✅ simple fallbacks (fast + safe)
-    fallback_day = round(float(daily.iloc[-1]), 2)
-    fallback_week = round(float(daily.tail(7).mean() * 7), 2)
-    fallback_month = round(float(daily.tail(30).mean() * 30), 2)
+    # Optional stronger gate: if too few unique days, skip ML
+    if daily.index.nunique() < 10:
+        return "Using average", fallback_day, fallback_week, fallback_month
 
+    # ✅ try ML
     series_df, msg = aggregate_expenses(df)
     if msg:
-        return "Insufficient data. Using averages.", fallback_day, fallback_week, fallback_month
+        return "Using average", fallback_day, fallback_week, fallback_month
 
     model = train_random_forest(series_df)
 
     preds_df = predict_future(model, series_df, days=days)
     if preds_df.empty:
-        return "Prediction failed. Using averages.", fallback_day, fallback_week, fallback_month
+        return "Using average", fallback_day, fallback_week, fallback_month
 
     next_day = round(float(preds_df.iloc[0]["daily_expense_pred"]), 2)
     next_week = round(float(preds_df.head(7)["daily_expense_pred"].sum()), 2)
     next_month = round(float(preds_df.head(min(30, len(preds_df)))["daily_expense_pred"].sum()), 2)
 
-    return "ML used (RandomForest) on last 6 months (or fallback).", next_day, next_week, next_month
+    return "ML used", next_day, next_week, next_month
 
 
 # =========================
 # FASTAPI LAYER
 # =========================
 
-app = FastAPI(title="SmartBudget ML API", version="1.0.2")
+app = FastAPI(title="SmartBudget ML API", version="1.0.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -238,7 +299,6 @@ def health():
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest):
     df = pd.DataFrame([t.model_dump() for t in req.transactions])
-
     msg, next_day, next_week, next_month = predict_all_horizons_multi(df, days=req.days)
 
     return {
