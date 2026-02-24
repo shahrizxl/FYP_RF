@@ -1,7 +1,7 @@
-# smartbudget_ml_api.py (FULL - corrected: one-time big transaction handling)
+# smartbudget_ml_api.py (FULL - improved & less strict for small data)
 # ✅ Detects large SINGLE transactions as "one-time"
-# ✅ Excludes one-time transactions from prediction modeling (heuristic + ML)
-# ✅ Still counts them in real monthly totals (your app UI / reports can use raw data)
+# ✅ Excludes one-time tx from prediction modeling (heuristic + ML)
+# ✅ Small-data friendly: spike rules AUTO-RELAX when history is short
 # ✅ Cold-start safe + spike-safe + ML once enough data
 #
 # Run:
@@ -21,7 +21,7 @@ from sklearn.ensemble import RandomForestRegressor
 # =========================
 # CONFIG (good defaults)
 # =========================
-MIN_UNIQUE_DAYS_FOR_ML = 30        # use ML when user has >=30 unique dates
+MIN_UNIQUE_DAYS_FOR_ML = 30        # use ML when user has >=30 unique dates (after one-time removal)
 MIN_ROWS_AFTER_FE = 60            # after feature engineering, need enough rows
 
 # One-time transaction detection (transaction-level)
@@ -30,8 +30,10 @@ ONE_TIME_FLOOR = 301.0            # also require >= RM300 (stops small users fro
 ONE_TIME_ONLY_IF_SINGLE = True    # only flag big single tx; not the whole day
 
 # Spike handling (daily-level for stability)
-SPIKE_MULTIPLIER = 3.0            # spike day if daily > median * 3
+# NOTE: spike rules are relaxed automatically for small histories (see _spike_multiplier_for_n)
+SPIKE_MULTIPLIER_DEFAULT = 3.0    # spike if daily > median * 3 (used when enough history)
 WINSOR_MULTIPLIER = 5.0           # cap daily for ML stability at median * 5
+MIN_DAYS_FOR_STRICT_SPIKES = 14   # before this, spike detection uses more relaxed multiplier
 
 # RandomForest
 RF_ESTIMATORS = 220
@@ -79,23 +81,53 @@ def _avg_calendar_window(daily: pd.Series, anchor: pd.Timestamp, window_days: in
     return float(filled.mean())
 
 
+def _spike_multiplier_for_n(unique_days: int) -> float:
+    """
+    Small-data friendly spike multiplier:
+      - very small history => very relaxed spike detection (avoid over-filtering)
+      - enough history => stricter default
+    """
+    if unique_days is None or unique_days <= 0:
+        return SPIKE_MULTIPLIER_DEFAULT
+
+    # 2..6 days: do NOT aggressively label spikes
+    if unique_days < 7:
+        return 8.0
+
+    # 7..13 days: still relaxed
+    if unique_days < MIN_DAYS_FOR_STRICT_SPIKES:
+        return 5.0
+
+    # 14+ days: normal behavior
+    return SPIKE_MULTIPLIER_DEFAULT
+
+
 def _robust_estimate_small_sample(vals: np.ndarray) -> float:
     """
     Best estimate for 2..6 days:
       - Use median (robust)
-      - Remove spike days > median*SPIKE_MULTIPLIER (if median>0)
-      - Estimate = median of remaining (or median if everything removed)
+      - If there are enough points (>=4), drop extreme outliers using RELAXED spike multiplier
+      - Return median of remaining (or original median if everything removed)
     """
     s = pd.Series(vals.astype(float))
     if s.empty:
         return 0.0
 
     med = float(s.median())
+
+    # if all zeros or tiny, fallback to mean of non-zero
     if med <= 0:
         nz = s[s > 0]
         return float(nz.mean()) if len(nz) else 0.0
 
-    filtered = s[s <= med * SPIKE_MULTIPLIER]
+    # For very small samples, be conservative: median only
+    if len(s) < 4:
+        return med
+
+    # relaxed spike filter for small samples
+    mult = 8.0
+    filtered = s[s <= med * mult]
+
     if len(filtered) == 0:
         return med
     return float(filtered.median())
@@ -103,9 +135,9 @@ def _robust_estimate_small_sample(vals: np.ndarray) -> float:
 
 def heuristic_v3_spike_safe(daily: pd.Series) -> Tuple[float, float, float]:
     """
-    Heuristic (spike-safe):
+    Heuristic (small-data friendly):
       1) Only 1 day => x, x*7, x*30
-      2) 2..6 days => robust_estimate * 7/30
+      2) 2..6 days => robust_estimate * 7/30 (light outlier trimming only if enough points)
       3) 7..29 days => avg(last 7 calendar days, incl 0s) => day=avg7, week=avg7*7, month=avg7*30
       4) >=30 days => day=avg7, week=avg7*7, month=avg30*30
     """
@@ -144,11 +176,21 @@ def _winsorize_daily(series: pd.Series) -> pd.Series:
 
 
 def _compute_spike_flags(daily: pd.Series) -> pd.Series:
-    """Spike day based on daily median: spike if daily > median * SPIKE_MULTIPLIER."""
-    med = float(daily.median()) if len(daily) else 0.0
+    """
+    Spike day flag:
+      spike if daily > median * multiplier
+    multiplier AUTO-RELAXED when history is short to avoid false spikes.
+    """
+    if daily is None or daily.empty:
+        return pd.Series(dtype=int)
+
+    s = daily.astype(float)
+    med = float(s.median()) if len(s) else 0.0
     if med <= 0:
-        return pd.Series(np.zeros(len(daily), dtype=int), index=daily.index)
-    return (daily > (med * SPIKE_MULTIPLIER)).astype(int)
+        return pd.Series(np.zeros(len(s), dtype=int), index=s.index)
+
+    mult = _spike_multiplier_for_n(int(s.index.nunique()))
+    return (s > (med * mult)).astype(int)
 
 
 # =========================
@@ -166,20 +208,15 @@ def mark_one_time_transactions(raw: pd.DataFrame) -> Tuple[pd.DataFrame, float]:
     """
     df = raw.copy()
 
-    # compute median daily total from raw expenses (including all tx)
     daily_total = _daily_series(df)
     med_daily = float(daily_total.median()) if len(daily_total) else 0.0
 
     threshold = max(float(ONE_TIME_FLOOR), float(med_daily * ONE_TIME_MULTIPLIER))
-
-    # If user has extremely low history, med_daily might be tiny; floor keeps it sane.
     df["is_one_time"] = False
 
     if ONE_TIME_ONLY_IF_SINGLE:
-        # Flag only large SINGLE transactions (best for "laptop" case)
         df.loc[df["amount"] >= threshold, "is_one_time"] = True
     else:
-        # Alternative: flag whole day if the day total is huge (not recommended here)
         big_days = daily_total[daily_total >= threshold].index
         df.loc[df["date"].isin(big_days), "is_one_time"] = True
 
@@ -322,6 +359,9 @@ def predict_future(model: RandomForestRegressor, series_df: pd.DataFrame, days: 
     recent_med = float(temp_df["daily_expense"].tail(60).median()) if len(temp_df) else 0.0
     hard_cap = (recent_med * WINSOR_MULTIPLIER) if recent_med > 0 else None
 
+    # use a stable spike multiplier for future spike flags based on current history
+    spike_mult = _spike_multiplier_for_n(int(series_df.index.nunique()))
+
     for d in future_dates:
         row = _make_feature_row(temp_df, d)
         X_pred = pd.DataFrame([row])[FEATURES]
@@ -334,9 +374,9 @@ def predict_future(model: RandomForestRegressor, series_df: pd.DataFrame, days: 
         preds.append(pred)
         temp_df.loc[d, "daily_expense"] = pred
 
-        # update spike flag (simple rule vs rolling median)
+        # update spike flag (based on rolling median)
         roll_med = float(temp_df["daily_expense"].tail(60).median()) if len(temp_df) else 0.0
-        temp_df.loc[d, "is_spike"] = 1 if (roll_med > 0 and pred > roll_med * SPIKE_MULTIPLIER) else 0
+        temp_df.loc[d, "is_spike"] = 1 if (roll_med > 0 and pred > roll_med * spike_mult) else 0
 
     return pd.DataFrame({"daily_expense_pred": preds}, index=future_dates)
 
@@ -350,7 +390,7 @@ def predict_all_horizons_multi(transactions_df: pd.DataFrame, days: int = 30):
     Returns: (message, next_day, next_week, next_month)
 
     ✅ One-time tx removed from modeling (laptop case)
-    ✅ Still uses robust heuristic if ML not ready
+    ✅ Small-data friendly heuristic
     ✅ ML uses last 6 months based on latest date
     """
     if transactions_df is None or transactions_df.empty:
@@ -430,7 +470,7 @@ def predict_all_horizons_multi(transactions_df: pd.DataFrame, days: int = 30):
 # FASTAPI
 # =========================
 
-app = FastAPI(title="SmartBudget ML API", version="2.1.0")
+app = FastAPI(title="SmartBudget ML API", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -460,10 +500,6 @@ class PredictResponse(BaseModel):
     next_week: float
     next_month: float
 
-
-@app.get("/health")
-def health():
-    return {"ok": True}
 
 
 @app.post("/predict", response_model=PredictResponse)
