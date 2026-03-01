@@ -388,7 +388,7 @@ def predict_all_horizons_multi(
         predicted_remaining = float(fallback_day * remaining_days) if remaining_days > 0 else 0.0
         this_month_forecast = round(spent_so_far + predicted_remaining, 2)
 
-        msg = "Using average (cold start)"
+        msg = "Using average"
         if one_time_count > 0:
             msg += f" - excluded {one_time_count} one-time tx (>= {floor_th:.0f})"
         return msg, float(fallback_day), float(fallback_week), float(this_month_forecast)
@@ -399,7 +399,7 @@ def predict_all_horizons_multi(
         predicted_remaining = float(fallback_day * remaining_days) if remaining_days > 0 else 0.0
         this_month_forecast = round(spent_so_far + predicted_remaining, 2)
 
-        msg = f"Using average ({err})"
+        msg = f"Using average"
         if one_time_count > 0:
             msg += f" - excluded {one_time_count} one-time tx (>= {floor_th:.0f})"
         return msg, float(fallback_day), float(fallback_week), float(this_month_forecast)
@@ -417,7 +417,7 @@ def predict_all_horizons_multi(
         predicted_remaining = float(fallback_day * remaining_days) if remaining_days > 0 else 0.0
         this_month_forecast = round(spent_so_far + predicted_remaining, 2)
 
-        msg = "Using average (prediction empty)"
+        msg = "Using average"
         if one_time_count > 0:
             msg += f" - excluded {one_time_count} one-time tx (>= {floor_th:.0f})"
         return msg, float(fallback_day), float(fallback_week), float(this_month_forecast)
