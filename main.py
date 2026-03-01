@@ -1,14 +1,14 @@
 # smartbudget_ml_api.py
-# FULL - FINAL (RM300-only one-time rule + past-month guard + fixed future-month ML alignment)
+# FULL - FINAL (RM300-only one-time rule + REAL past-month guard + fixed future-month ML alignment)
 # ✅ One-time tx detection: amount >= RM300 ONLY -> excludes from modeling
 # ✅ Small-data friendly heuristics (works even with 1 record)
 # ✅ Calendar-month forecast using anchor_year/anchor_month:
 #    this_month = spent_so_far_in_that_month (REAL, includes one-time)
 #              + predicted_remaining_until_month_end (habit-only)
 # ✅ FIXED: future-month remaining prediction sums ONLY dates inside selected month window
-# ✅ NEW: If user selects a PAST month (already complete), return ACTUAL total (no ML forecast)
+# ✅ FIXED: If user selects a PAST month (relative to REAL TODAY), return ACTUAL total (no ML forecast)
 # ✅ ML engine = SIMPLE RandomForest ONLY (lags + rolling means)
-
+#
 # Run:
 #   uvicorn smartbudget_ml_api:app --host 0.0.0.0 --port 8000
 
@@ -173,9 +173,7 @@ def mark_one_time_transactions(raw: pd.DataFrame) -> Tuple[pd.DataFrame, Tuple[f
 
 # ======================================================
 # ✅ SIMPLE ML ENGINE (RandomForest ONLY)
-#    (this is the part you asked to use "inside this")
 # ======================================================
-
 def aggregate_expenses_simple(df: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[str]]:
     """
     Simple feature engineering:
@@ -308,8 +306,8 @@ def predict_all_horizons_multi(
        spent_so_far (REAL, includes one-time)
        + predicted_remaining (habit-only)
 
-    Past month behavior:
-       if anchor month already ended before latest tx date -> return ACTUAL total (no forecast)
+    ✅ Past month behavior (REAL calendar):
+       if anchor month already ended before TODAY -> return ACTUAL total (no forecast)
     """
     if transactions_df is None or transactions_df.empty:
         return "No expense data available.", 0.0, 0.0, 0.0
@@ -347,9 +345,12 @@ def predict_all_horizons_multi(
     anchor_start = pd.Timestamp(date(ay, am, 1))
     anchor_end = pd.Timestamp(date(ay, am, last_day))
 
-    # ✅ Past month guard: month is already completed and fully known
-    if anchor_end < latest:
-        actual = float(raw[(raw["date"] >= anchor_start) & (raw["date"] <= anchor_end)]["amount"].sum())
+    # ✅ REAL past month guard (based on real calendar TODAY)
+    today = pd.Timestamp(date.today())  # local server date
+    if anchor_end < today:
+        actual = float(
+            raw[(raw["date"] >= anchor_start) & (raw["date"] <= anchor_end)]["amount"].sum()
+        )
         return "Past month - showing actual total", 0.0, 0.0, round(actual, 2)
 
     # Real spent so far in anchor month (includes one-time)
@@ -443,7 +444,7 @@ def predict_all_horizons_multi(
 # =========================
 # FASTAPI (single app)
 # =========================
-app = FastAPI(title="SmartBudget ML API", version="2.6.1")
+app = FastAPI(title="SmartBudget ML API", version="2.6.2")
 
 app.add_middleware(
     CORSMiddleware,
