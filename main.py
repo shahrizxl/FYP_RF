@@ -1,8 +1,9 @@
-# smartbudget_ml_api.py (FULL - improved & less strict for small data)
+# smartbudget_ml_api.py (FULL - corrected & small-data robust)
 # ✅ Detects large SINGLE transactions as "one-time"
 # ✅ Excludes one-time tx from prediction modeling (heuristic + ML)
 # ✅ Small-data friendly: spike rules AUTO-RELAX when history is short
-# ✅ Cold-start safe + spike-safe + ML once enough data
+# ✅ One-time threshold is now ROBUST for small data (won't get distorted by 1 huge day)
+# ✅ Clearer error messages
 #
 # Run:
 #   uvicorn smartbudget_ml_api:app --host 0.0.0.0 --port 8000
@@ -21,16 +22,15 @@ from sklearn.ensemble import RandomForestRegressor
 # =========================
 # CONFIG (good defaults)
 # =========================
-MIN_UNIQUE_DAYS_FOR_ML = 30        # use ML when user has >=30 unique dates (after one-time removal)
+MIN_UNIQUE_DAYS_FOR_ML = 30        # ML when user has >=30 unique SPENDING dates (after one-time removal)
 MIN_ROWS_AFTER_FE = 60            # after feature engineering, need enough rows
 
 # One-time transaction detection (transaction-level)
-ONE_TIME_MULTIPLIER = 5.0         # one-time if tx_amount >= median_daily * 5
-ONE_TIME_FLOOR = 301.0            # also require >= RM300 (stops small users from over-flagging)
+ONE_TIME_MULTIPLIER = 5.0         # one-time if tx_amount >= typical_daily * 5
+ONE_TIME_FLOOR = 301.0            # require >= RM300 too (prevents over-flagging)
 ONE_TIME_ONLY_IF_SINGLE = True    # only flag big single tx; not the whole day
 
 # Spike handling (daily-level for stability)
-# NOTE: spike rules are relaxed automatically for small histories (see _spike_multiplier_for_n)
 SPIKE_MULTIPLIER_DEFAULT = 3.0    # spike if daily > median * 3 (used when enough history)
 WINSOR_MULTIPLIER = 5.0           # cap daily for ML stability at median * 5
 MIN_DAYS_FOR_STRICT_SPIKES = 14   # before this, spike detection uses more relaxed multiplier
@@ -64,6 +64,8 @@ FEATURES = [
 
 def _daily_series(df: pd.DataFrame) -> pd.Series:
     """date -> total amount for that day (only days with data)."""
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
     return df.groupby("date")["amount"].sum().sort_index()
 
 
@@ -90,15 +92,10 @@ def _spike_multiplier_for_n(unique_days: int) -> float:
     if unique_days is None or unique_days <= 0:
         return SPIKE_MULTIPLIER_DEFAULT
 
-    # 2..6 days: do NOT aggressively label spikes
     if unique_days < 7:
         return 8.0
-
-    # 7..13 days: still relaxed
     if unique_days < MIN_DAYS_FOR_STRICT_SPIKES:
         return 5.0
-
-    # 14+ days: normal behavior
     return SPIKE_MULTIPLIER_DEFAULT
 
 
@@ -106,7 +103,7 @@ def _robust_estimate_small_sample(vals: np.ndarray) -> float:
     """
     Best estimate for 2..6 days:
       - Use median (robust)
-      - If there are enough points (>=4), drop extreme outliers using RELAXED spike multiplier
+      - If >=4 points, drop extreme outliers using RELAXED multiplier
       - Return median of remaining (or original median if everything removed)
     """
     s = pd.Series(vals.astype(float))
@@ -115,19 +112,15 @@ def _robust_estimate_small_sample(vals: np.ndarray) -> float:
 
     med = float(s.median())
 
-    # if all zeros or tiny, fallback to mean of non-zero
     if med <= 0:
         nz = s[s > 0]
         return float(nz.mean()) if len(nz) else 0.0
 
-    # For very small samples, be conservative: median only
     if len(s) < 4:
         return med
 
-    # relaxed spike filter for small samples
     mult = 8.0
     filtered = s[s <= med * mult]
-
     if len(filtered) == 0:
         return med
     return float(filtered.median())
@@ -137,8 +130,8 @@ def heuristic_v3_spike_safe(daily: pd.Series) -> Tuple[float, float, float]:
     """
     Heuristic (small-data friendly):
       1) Only 1 day => x, x*7, x*30
-      2) 2..6 days => robust_estimate * 7/30 (light outlier trimming only if enough points)
-      3) 7..29 days => avg(last 7 calendar days, incl 0s) => day=avg7, week=avg7*7, month=avg7*30
+      2) 2..6 days => robust_estimate * 7/30
+      3) 7..29 days => avg(last 7 calendar days incl 0s) => month = avg7*30
       4) >=30 days => day=avg7, week=avg7*7, month=avg30*30
     """
     if daily is None or daily.empty:
@@ -194,13 +187,44 @@ def _compute_spike_flags(daily: pd.Series) -> pd.Series:
 
 
 # =========================
-# ONE-TIME TRANSACTION DETECTION
+# ONE-TIME TRANSACTION DETECTION (ROBUST)
 # =========================
+
+def _robust_typical_daily(daily_total: pd.Series) -> float:
+    """
+    Robust 'typical daily' for one-time threshold:
+    - Works better for tiny history where 1 huge day can distort the median.
+    - Procedure:
+        1) median
+        2) remove extreme days > median*8 (relaxed)
+        3) recompute median on remaining (fallback to original median)
+    """
+    if daily_total is None or daily_total.empty:
+        return 0.0
+
+    s = daily_total.astype(float).copy()
+    base_med = float(s.median())
+
+    if base_med <= 0:
+        nz = s[s > 0]
+        return float(nz.median()) if len(nz) else 0.0
+
+    # relaxed trimming (only removes truly extreme days)
+    trimmed = s[s <= base_med * 8.0]
+    if len(trimmed) >= max(3, int(0.6 * len(s))):
+        return float(trimmed.median())
+
+    # fallback
+    return base_med
+
 
 def mark_one_time_transactions(raw: pd.DataFrame) -> Tuple[pd.DataFrame, float]:
     """
     Marks large SINGLE transactions as one-time.
-    Threshold = max(ONE_TIME_FLOOR, median_daily_total * ONE_TIME_MULTIPLIER)
+    Threshold = max(ONE_TIME_FLOOR, typical_daily_total * ONE_TIME_MULTIPLIER)
+
+    typical_daily_total is computed robustly to avoid being distorted by 1 huge day
+    in small datasets.
 
     Returns:
       df_marked with column: is_one_time (bool)
@@ -209,9 +233,9 @@ def mark_one_time_transactions(raw: pd.DataFrame) -> Tuple[pd.DataFrame, float]:
     df = raw.copy()
 
     daily_total = _daily_series(df)
-    med_daily = float(daily_total.median()) if len(daily_total) else 0.0
+    typical_daily = _robust_typical_daily(daily_total)
 
-    threshold = max(float(ONE_TIME_FLOOR), float(med_daily * ONE_TIME_MULTIPLIER))
+    threshold = max(float(ONE_TIME_FLOOR), float(typical_daily * ONE_TIME_MULTIPLIER))
     df["is_one_time"] = False
 
     if ONE_TIME_ONLY_IF_SINGLE:
@@ -247,7 +271,6 @@ def aggregate_expenses_spike_aware(df_model: pd.DataFrame) -> Tuple[pd.DataFrame
     if daily_raw.empty:
         return pd.DataFrame(), "No data."
 
-    # full calendar range (fill 0 for missing days)
     full_range = pd.date_range(daily_raw.index.min(), daily_raw.index.max(), freq="D")
     series_df = daily_raw.reindex(full_range, fill_value=0.0).to_frame("daily_expense")
 
@@ -291,7 +314,7 @@ def aggregate_expenses_spike_aware(df_model: pd.DataFrame) -> Tuple[pd.DataFrame
     series_df = series_df.dropna()
 
     if len(series_df) < MIN_ROWS_AFTER_FE:
-        return pd.DataFrame(), "No data."
+        return pd.DataFrame(), f"Not enough history after features (have {len(series_df)}, need {MIN_ROWS_AFTER_FE})."
 
     return series_df, None
 
@@ -355,11 +378,9 @@ def predict_future(model: RandomForestRegressor, series_df: pd.DataFrame, days: 
     temp_df = series_df[["daily_expense", "is_spike"]].copy()
     preds = []
 
-    # hard cap to prevent runaway recursion
     recent_med = float(temp_df["daily_expense"].tail(60).median()) if len(temp_df) else 0.0
     hard_cap = (recent_med * WINSOR_MULTIPLIER) if recent_med > 0 else None
 
-    # use a stable spike multiplier for future spike flags based on current history
     spike_mult = _spike_multiplier_for_n(int(series_df.index.nunique()))
 
     for d in future_dates:
@@ -374,7 +395,6 @@ def predict_future(model: RandomForestRegressor, series_df: pd.DataFrame, days: 
         preds.append(pred)
         temp_df.loc[d, "daily_expense"] = pred
 
-        # update spike flag (based on rolling median)
         roll_med = float(temp_df["daily_expense"].tail(60).median()) if len(temp_df) else 0.0
         temp_df.loc[d, "is_spike"] = 1 if (roll_med > 0 and pred > roll_med * spike_mult) else 0
 
@@ -391,14 +411,13 @@ def predict_all_horizons_multi(transactions_df: pd.DataFrame, days: int = 30):
 
     ✅ One-time tx removed from modeling (laptop case)
     ✅ Small-data friendly heuristic
-    ✅ ML uses last 6 months based on latest date
+    ✅ ML uses last 6 months based on latest date in payload
     """
     if transactions_df is None or transactions_df.empty:
         return "No expense data available.", 0.0, 0.0, 0.0
 
     raw = transactions_df.copy()
 
-    # keep only expenses
     if "type" in raw.columns:
         raw = raw[raw["type"] == "expense"]
 
@@ -412,36 +431,29 @@ def predict_all_horizons_multi(transactions_df: pd.DataFrame, days: int = 30):
     if raw.empty or float(raw["amount"].sum()) == 0.0:
         return "No expense data available.", 0.0, 0.0, 0.0
 
-    # last 6 months window based on latest date in payload
     latest = raw["date"].max()
     cutoff = latest - pd.DateOffset(months=6)
     df6 = raw[raw["date"] >= cutoff]
     df = df6 if len(df6) >= 10 else raw
 
-    # mark one-time transactions (laptop)
     df_marked, one_time_threshold = mark_one_time_transactions(df)
-
-    # df_model excludes one-time tx for prediction modeling ONLY
     df_model = df_marked[df_marked["is_one_time"] == False].copy()
     one_time_count = int(df_marked["is_one_time"].sum())
 
-    # fallback heuristic uses model-only data (so laptop won't ruin it)
     daily_model = _daily_series(df_model) if not df_model.empty else pd.Series(dtype=float)
     fallback_day, fallback_week, fallback_month = heuristic_v3_spike_safe(daily_model)
 
     unique_days = int(daily_model.index.nunique()) if len(daily_model) else 0
 
-    # gate ML (cold start)
     if unique_days < MIN_UNIQUE_DAYS_FOR_ML:
         msg = "Using average (cold start)"
         if one_time_count > 0:
             msg += f" - excluded {one_time_count} one-time tx (>= {one_time_threshold:.0f})"
         return msg, fallback_day, fallback_week, fallback_month
 
-    # try ML
     series_df, err = aggregate_expenses_spike_aware(df_model)
     if err:
-        msg = "Using average (not enough history)"
+        msg = f"Using average ({err})"
         if one_time_count > 0:
             msg += f" - excluded {one_time_count} one-time tx (>= {one_time_threshold:.0f})"
         return msg, fallback_day, fallback_week, fallback_month
@@ -470,7 +482,7 @@ def predict_all_horizons_multi(transactions_df: pd.DataFrame, days: int = 30):
 # FASTAPI
 # =========================
 
-app = FastAPI(title="SmartBudget ML API", version="2.2.0")
+app = FastAPI(title="SmartBudget ML API", version="2.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -499,7 +511,6 @@ class PredictResponse(BaseModel):
     next_day: float
     next_week: float
     next_month: float
-
 
 
 @app.post("/predict", response_model=PredictResponse)
