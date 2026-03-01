@@ -1,12 +1,9 @@
-# smartbudget_ml_api.py (FULL - FINAL)
-# ✅ Transaction-level one-time detection (checks EACH transaction)
-# ✅ One-time transactions EXCLUDED from prediction model
-# ✅ One-time transactions STILL INCLUDED in "spent so far" (real month total)
-# ✅ Anchor-month transactions ALWAYS included in one-time marking (even if outside last 6 months)
-# ✅ Your averaging rules for cold-start / fallback:
-#    - 1 day: tomorrow = that day; week = x7; month = x30
-#    - 2..6 days: tomorrow = total/days; week = *7; month = *30
-#    - >=7 days: tomorrow = avg7 calendar; week = avg7*7; month = avg30*30 if >=30 else avg7*30
+# smartbudget_ml_api.py (FULL - Calendar-MONTH forecast + transaction-level one-time exclusion)
+# ✅ Forecasts THIS calendar month (based on anchor_year/anchor_month or latest tx month)
+# ✅ Checks EACH transaction: if "big" -> is_one_time = True
+# ✅ One-time EXCLUDED from prediction model (heuristic + ML)
+# ✅ One-time INCLUDED in "spent so far" (real month total)
+# ✅ Small-data friendly: fallback follows your rules
 #
 # Run:
 #   uvicorn smartbudget_ml_api:app --host 0.0.0.0 --port 8000
@@ -29,13 +26,13 @@ MIN_UNIQUE_DAYS_FOR_ML = 30
 MIN_ROWS_AFTER_FE = 60
 
 # One-time transaction detection (transaction-level)
-ONE_TIME_FLOOR = 300.0            # hard minimum
-ONE_TIME_MULTIPLIER = 3.0         # vs user's typical daily total (median daily total)
-ONE_TIME_USE_PERCENTILE = True    # enable percentile rule if enough tx
-ONE_TIME_PERCENTILE = 0.95        # 95th percentile of tx amounts
+ONE_TIME_FLOOR = 300.0
+ONE_TIME_MULTIPLIER = 3.0
+ONE_TIME_USE_PERCENTILE = True
+ONE_TIME_PERCENTILE = 0.95
 ONE_TIME_MIN_TX_FOR_PERCENTILE = 20
 
-# Spike handling (for ML features only; cold-start uses your simple average rules)
+# Spike handling (for ML features only)
 SPIKE_MULTIPLIER_DEFAULT = 3.0
 WINSOR_MULTIPLIER = 5.0
 MIN_DAYS_FOR_STRICT_SPIKES = 14
@@ -47,7 +44,7 @@ RANDOM_STATE = 42
 
 
 # =========================
-# FEATURES (spike-aware)
+# FEATURES
 # =========================
 FEATURES = [
     "day_of_week", "is_weekend", "month", "day",
@@ -64,22 +61,24 @@ FEATURES = [
 
 
 # =========================
-# BASIC HELPERS
+# HELPERS
 # =========================
 
-def _daily_series(df: pd.DataFrame) -> pd.Series:
-    """date -> total amount for that day (only days with data)."""
+def _sanitize(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
-        return pd.Series(dtype=float)
-
+        return pd.DataFrame(columns=["date", "amount"])
     d = df.copy()
     d["date"] = pd.to_datetime(d["date"], errors="coerce").dt.normalize()
     d["amount"] = pd.to_numeric(d["amount"], errors="coerce")
     d = d.dropna(subset=["date", "amount"])
+    return d
 
+
+def _daily_series(df: pd.DataFrame) -> pd.Series:
+    """date -> total amount for that day (only days with data)."""
+    d = _sanitize(df)
     if d.empty:
         return pd.Series(dtype=float)
-
     return d.groupby("date")["amount"].sum().sort_index()
 
 
@@ -91,41 +90,6 @@ def _avg_calendar_window(daily: pd.Series, anchor: pd.Timestamp, window_days: in
     idx = pd.date_range(anchor - pd.Timedelta(days=window_days - 1), anchor, freq="D")
     filled = daily.reindex(idx, fill_value=0.0)
     return float(filled.mean())
-
-
-def _spike_multiplier_for_n(unique_days: int) -> float:
-    """Small-data friendly spike multiplier."""
-    if unique_days is None or unique_days <= 0:
-        return SPIKE_MULTIPLIER_DEFAULT
-    if unique_days < 7:
-        return 8.0
-    if unique_days < MIN_DAYS_FOR_STRICT_SPIKES:
-        return 5.0
-    return SPIKE_MULTIPLIER_DEFAULT
-
-
-def _winsorize_daily(series: pd.Series) -> pd.Series:
-    """Cap extreme daily values for ML stability: cap = median * WINSOR_MULTIPLIER."""
-    s = series.astype(float).copy()
-    med = float(s.median()) if len(s) else 0.0
-    if med > 0:
-        cap = med * WINSOR_MULTIPLIER
-        return s.clip(upper=cap)
-    return s
-
-
-def _compute_spike_flags(daily: pd.Series) -> pd.Series:
-    """Spike if daily > median * multiplier (auto-relaxed for short history)."""
-    if daily is None or daily.empty:
-        return pd.Series(dtype=int)
-
-    s = daily.astype(float)
-    med = float(s.median()) if len(s) else 0.0
-    if med <= 0:
-        return pd.Series(np.zeros(len(s), dtype=int), index=s.index)
-
-    mult = _spike_multiplier_for_n(int(s.index.nunique()))
-    return (s > (med * mult)).astype(int)
 
 
 def _month_start(y: int, m: int) -> pd.Timestamp:
@@ -143,8 +107,16 @@ def _remaining_days_from_anchor_to_end(anchor: pd.Timestamp, end: pd.Timestamp) 
     return max(0, int((e - a).days))
 
 
+def _filter_to_month(df_any: pd.DataFrame, y: int, m: int) -> pd.DataFrame:
+    if df_any is None or df_any.empty:
+        return df_any
+    start = _month_start(y, m)
+    end = _month_end_for(y, m)
+    return df_any[(df_any["date"] >= start) & (df_any["date"] <= end)].copy()
+
+
 def _spent_so_far_in_month(df_any: pd.DataFrame, y: int, m: int, up_to: pd.Timestamp) -> float:
-    """Sum of amounts from month start to 'up_to' (inclusive) for that (y,m)."""
+    """Sum of amounts from month start to 'up_to' (inclusive)."""
     if df_any is None or df_any.empty:
         return 0.0
 
@@ -161,16 +133,41 @@ def _spent_so_far_in_month(df_any: pd.DataFrame, y: int, m: int, up_to: pd.Times
     return float(df_any.loc[mask, "amount"].sum())
 
 
-def _filter_to_month(df_any: pd.DataFrame, y: int, m: int) -> pd.DataFrame:
-    if df_any is None or df_any.empty:
-        return df_any
-    start = _month_start(y, m)
-    end = _month_end_for(y, m)
-    return df_any[(df_any["date"] >= start) & (df_any["date"] <= end)].copy()
+def _spike_multiplier_for_n(unique_days: int) -> float:
+    """Small-data friendly spike multiplier."""
+    if unique_days is None or unique_days <= 0:
+        return SPIKE_MULTIPLIER_DEFAULT
+    if unique_days < 7:
+        return 8.0
+    if unique_days < MIN_DAYS_FOR_STRICT_SPIKES:
+        return 5.0
+    return SPIKE_MULTIPLIER_DEFAULT
+
+
+def _winsorize_daily(series: pd.Series) -> pd.Series:
+    """Cap extreme daily values: cap = median * WINSOR_MULTIPLIER."""
+    s = series.astype(float).copy()
+    med = float(s.median()) if len(s) else 0.0
+    if med > 0:
+        cap = med * WINSOR_MULTIPLIER
+        return s.clip(upper=cap)
+    return s
+
+
+def _compute_spike_flags(daily: pd.Series) -> pd.Series:
+    """Spike if daily > median * multiplier (auto-relaxed for short history)."""
+    if daily is None or daily.empty:
+        return pd.Series(dtype=int)
+    s = daily.astype(float)
+    med = float(s.median()) if len(s) else 0.0
+    if med <= 0:
+        return pd.Series(np.zeros(len(s), dtype=int), index=s.index)
+    mult = _spike_multiplier_for_n(int(s.index.nunique()))
+    return (s > (med * mult)).astype(int)
 
 
 # =========================
-# YOUR AVERAGING RULES (FALLBACK)
+# YOUR AVERAGING RULES (fallback)
 # =========================
 
 def heuristic_user_average(
@@ -178,7 +175,7 @@ def heuristic_user_average(
     anchor: Optional[pd.Timestamp] = None
 ) -> Tuple[float, float, float]:
     """
-    YOUR rules:
+    Your rules:
     - 1 day: tomorrow = that day; week = x7; month = x30
     - 2..6 days: tomorrow = total/days; week = *7; month = *30
     - >=7 days: tomorrow = avg7 calendar; week = avg7*7;
@@ -188,7 +185,6 @@ def heuristic_user_average(
         return 0.0, 0.0, 0.0
 
     daily = daily.sort_index().astype(float)
-
     if anchor is None:
         anchor = daily.index.max()
     else:
@@ -219,40 +215,27 @@ def heuristic_user_average(
 
 def mark_one_time_transactions(raw: pd.DataFrame) -> Tuple[pd.DataFrame, float]:
     """
-    Flags EACH transaction if it's big (one-time), then you exclude those from prediction.
-
-    threshold = max(
-        ONE_TIME_FLOOR,
-        median_daily_total * ONE_TIME_MULTIPLIER,
-        tx_percentile(95%) if enough tx
-    )
+    Flags EACH transaction as one-time if amount >= threshold.
+    threshold = max(ONE_TIME_FLOOR, median_daily_total*MULTIPLIER, tx_percentile if enough tx)
     """
-    df = raw.copy()
-    df["is_one_time"] = False
-
-    # sanitize
-    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").astype(float)
-    df = df.dropna(subset=["date", "amount"])
-
+    df = _sanitize(raw)
     if df.empty:
+        df["is_one_time"] = False
         return df, float(ONE_TIME_FLOOR)
 
-    # personalized daily baseline
+    df["is_one_time"] = False
+
     daily_total = df.groupby("date")["amount"].sum().sort_index()
     med_daily = float(daily_total.median()) if len(daily_total) else 0.0
 
-    # optional percentile baseline
-    tx = df["amount"].values
+    tx = df["amount"].astype(float).values
     q = 0.0
     if ONE_TIME_USE_PERCENTILE and len(tx) >= ONE_TIME_MIN_TX_FOR_PERCENTILE:
         q = float(np.quantile(tx, ONE_TIME_PERCENTILE))
 
     threshold = max(float(ONE_TIME_FLOOR), float(med_daily * ONE_TIME_MULTIPLIER), float(q))
 
-    # ✅ check EACH transaction row
     df.loc[df["amount"] >= threshold, "is_one_time"] = True
-
     return df, float(threshold)
 
 
@@ -261,16 +244,12 @@ def mark_one_time_transactions(raw: pd.DataFrame) -> Tuple[pd.DataFrame, float]:
 # =========================
 
 def aggregate_expenses_spike_aware(df_model: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[str]]:
-    """Build continuous daily series + features."""
+    """Build continuous daily series + features. df_model must exclude one-time tx."""
     if df_model is None or df_model.empty:
         return pd.DataFrame(), "No data."
 
-    df = df_model.copy()
-
-    if "type" in df.columns:
-        df = df[df["type"] == "expense"]
-
-    if df.empty or "date" not in df.columns or "amount" not in df.columns:
+    df = _sanitize(df_model)
+    if df.empty:
         return pd.DataFrame(), "No data."
 
     daily_raw = df.groupby("date")["amount"].sum().sort_index()
@@ -401,10 +380,10 @@ def predict_future(model: RandomForestRegressor, series_df: pd.DataFrame, days: 
 
 
 # =========================
-# MAIN PREDICT
+# MAIN PREDICT (Calendar-month)
 # =========================
 
-def predict_all_horizons_multi(
+def predict_all_horizons_calendar_month(
     transactions_df: pd.DataFrame,
     days: int = 30,
     anchor_year: Optional[int] = None,
@@ -413,24 +392,17 @@ def predict_all_horizons_multi(
     """
     Returns: (message, next_day, next_week, this_month_forecast)
 
-    ✅ If anchor_year & anchor_month provided -> forecast THAT month.
-    ✅ Otherwise -> forecast month of latest tx date in payload.
+    - If anchor_year & anchor_month provided -> forecast THAT month.
+    - Else -> forecast month of latest tx in payload.
     """
     if transactions_df is None or transactions_df.empty:
         return "No expense data available.", 0.0, 0.0, 0.0
 
     raw = transactions_df.copy()
-
     if "type" in raw.columns:
         raw = raw[raw["type"] == "expense"]
 
-    if raw.empty or "date" not in raw.columns or "amount" not in raw.columns:
-        return "No expense data available.", 0.0, 0.0, 0.0
-
-    raw["date"] = pd.to_datetime(raw["date"], errors="coerce").dt.normalize()
-    raw["amount"] = pd.to_numeric(raw["amount"], errors="coerce")
-    raw = raw.dropna(subset=["date", "amount"])
-
+    raw = _sanitize(raw)
     if raw.empty or float(raw["amount"].sum()) == 0.0:
         return "No expense data available.", 0.0, 0.0, 0.0
 
@@ -448,46 +420,46 @@ def predict_all_horizons_multi(
     month_end = _month_end_for(ay, am)
 
     # Anchor date inside that month (or just before month_start if no tx in month)
-    in_month = raw[(raw["date"] >= month_start) & (raw["date"] <= month_end)]
-    if in_month.empty:
+    in_month_raw = raw[(raw["date"] >= month_start) & (raw["date"] <= month_end)]
+    if in_month_raw.empty:
         anchor_date = month_start - pd.Timedelta(days=1)
         spent_so_far_real = 0.0
     else:
-        anchor_date = in_month["date"].max()
-        spent_so_far_real = None
+        anchor_date = in_month_raw["date"].max()
+        spent_so_far_real = None  # compute after marking
 
-    # 6-month history for thresholds + modeling
+    # Build marking base: last 6 months history (or all if too small)
     cutoff = latest - pd.DateOffset(months=6)
     df6 = raw[raw["date"] >= cutoff]
     df_hist = df6 if len(df6) >= 10 else raw
 
-    # ✅ Always include anchor month tx in one-time marking
+    # Always include anchor-month tx in marking base
     df_anchor_month = raw[(raw["date"] >= month_start) & (raw["date"] <= month_end)].copy()
     df_mark_base = df_hist.copy()
     if not df_anchor_month.empty:
         df_mark_base = pd.concat([df_mark_base, df_anchor_month], ignore_index=True)
 
-    # Mark one-time (transaction-level)
+    # Mark one-time
     df_marked, one_time_threshold = mark_one_time_transactions(df_mark_base)
     one_time_count = int(df_marked["is_one_time"].sum())
 
-    # spent_so_far includes one-time (REAL)
+    # Real spent so far (includes one-time)
     df_marked_month = _filter_to_month(df_marked, ay, am)
     if spent_so_far_real is None:
         spent_so_far_real = _spent_so_far_in_month(df_marked_month, ay, am, up_to=anchor_date)
 
-    # ✅ Model excludes one-time
+    # Model excludes one-time
     df_model = df_marked[df_marked["is_one_time"] == False].copy()
 
-    # Remaining days after anchor_date
+    # Remaining days in month after anchor_date
     remaining_days = _remaining_days_from_anchor_to_end(anchor_date, month_end)
 
-    # Your fallback averages (based on model data only)
+    # Fallback based on model-only (your rules)
     daily_model = _daily_series(df_model)
     fallback_day, fallback_week, _fallback_month30 = heuristic_user_average(daily_model, anchor=anchor_date)
     spend_days = int(daily_model.index.nunique()) if len(daily_model) else 0
 
-    # Cold start (use your rule)
+    # Cold start
     if spend_days < MIN_UNIQUE_DAYS_FOR_ML:
         forecast_this_month = float(spent_so_far_real + (fallback_day * remaining_days))
         msg = "Using average (cold start, ML not used)"
@@ -495,7 +467,7 @@ def predict_all_horizons_multi(
             msg += f" - excluded {one_time_count} one-time tx from model (>= {one_time_threshold:.0f})"
         return msg, float(fallback_day), float(fallback_week), round(forecast_this_month, 2)
 
-    # ML path
+    # ML
     series_df, err = aggregate_expenses_spike_aware(df_model)
     if err:
         forecast_this_month = float(spent_so_far_real + (fallback_day * remaining_days))
@@ -506,11 +478,11 @@ def predict_all_horizons_multi(
 
     model = train_random_forest(series_df)
 
+    # Predict enough days to cover remaining days in THIS month (and at least 7 for next_week)
     need_days = max(7, remaining_days, int(days))
     need_days = min(365, max(1, need_days))
 
     preds_df = predict_future(model, series_df, days=need_days)
-
     if preds_df.empty:
         forecast_this_month = float(spent_so_far_real + (fallback_day * remaining_days))
         msg = "Using average (prediction empty)"
@@ -521,6 +493,7 @@ def predict_all_horizons_multi(
     next_day = round(float(preds_df.iloc[0]["daily_expense_pred"]), 2)
     next_week = round(float(preds_df.head(7)["daily_expense_pred"].sum()), 2)
 
+    # Sum predictions that fall within this calendar month (after anchor date)
     pred_remaining = float(
         preds_df.loc[preds_df.index <= month_end, "daily_expense_pred"].sum()
     ) if remaining_days > 0 else 0.0
@@ -538,7 +511,7 @@ def predict_all_horizons_multi(
 # FASTAPI
 # =========================
 
-app = FastAPI(title="SmartBudget ML API", version="2.6.0")
+app = FastAPI(title="SmartBudget ML API", version="2.7.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -568,14 +541,14 @@ class PredictResponse(BaseModel):
     message: str
     next_day: float
     next_week: float
-    next_month: float
+    this_month: float
 
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest):
     df = pd.DataFrame([t.model_dump() for t in req.transactions])
 
-    msg, next_day, next_week, next_month = predict_all_horizons_multi(
+    msg, next_day, next_week, this_month = predict_all_horizons_calendar_month(
         df,
         days=req.days,
         anchor_year=req.anchor_year,
@@ -586,5 +559,5 @@ def predict(req: PredictRequest):
         "message": msg,
         "next_day": float(next_day),
         "next_week": float(next_week),
-        "next_month": float(next_month),
+        "this_month": float(this_month),
     }
