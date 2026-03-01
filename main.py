@@ -1,5 +1,5 @@
-# smartbudget_ml_api.py (FULL - BEST corrected)
-# ✅ One-time tx detection (RM300+ OR typical_daily*mult) -> excludes from modeling
+# smartbudget_ml_api.py (FULL - BEST corrected, single FastAPI app)
+# ✅ One-time tx detection (>= RM300 OR >= typical_daily*mult) -> excludes from modeling
 # ✅ Small-data friendly heuristics
 # ✅ Calendar-month forecast using anchor_year/anchor_month:
 #    this_month = spent_so_far_in_that_month (REAL, includes one-time)
@@ -27,7 +27,7 @@ MIN_UNIQUE_DAYS_FOR_ML = 30
 MIN_ROWS_AFTER_FE = 60
 
 ONE_TIME_MULTIPLIER = 5.0
-ONE_TIME_FLOOR = 300.0            # ✅ correct for ">= 300"
+ONE_TIME_FLOOR = 300.0            # ✅ RM300+ means >= 300
 ONE_TIME_ONLY_IF_SINGLE = True
 ONE_TIME_USE_OR_RULE = True       # ✅ OR rule (>= floor OR >= multiplier threshold)
 
@@ -417,27 +417,37 @@ def predict_all_horizons_multi(
 
     raw = transactions_df.copy()
 
+    # keep expense only
     if "type" in raw.columns:
+        raw["type"] = raw["type"].astype(str).str.strip().str.lower()
         raw = raw[raw["type"] == "expense"]
 
+    # must have date+amount
     if raw.empty or "date" not in raw.columns or "amount" not in raw.columns:
         return "No expense data available.", 0.0, 0.0, 0.0
 
+    # parse date/amount safely
     raw["date"] = pd.to_datetime(raw["date"], errors="coerce").dt.normalize()
     raw["amount"] = pd.to_numeric(raw["amount"], errors="coerce")
+
+    # drop invalid
     raw = raw.dropna(subset=["date", "amount"])
+
+    # keep non-negative only (optional safety)
+    raw = raw[raw["amount"] > 0]
 
     if raw.empty or float(raw["amount"].sum()) == 0.0:
         return "No expense data available.", 0.0, 0.0, 0.0
 
     latest = raw["date"].max()
 
-    # Decide anchor month
+    # Decide anchor month (selected month from Flutter)
     if anchor_year is not None and anchor_month is not None:
         ay, am = int(anchor_year), int(anchor_month)
     else:
         ay, am = int(latest.year), int(latest.month)
 
+    # anchor month boundaries
     last_day = calendar.monthrange(ay, am)[1]
     anchor_start = pd.Timestamp(date(ay, am, 1))
     anchor_end = pd.Timestamp(date(ay, am, last_day))
@@ -460,6 +470,7 @@ def predict_all_horizons_multi(
     df6 = raw[raw["date"] >= cutoff]
     df = df6 if len(df6) >= 10 else raw
 
+    # One-time marking + exclude from model
     df_marked, (floor_th, mult_th) = mark_one_time_transactions(df)
     one_time_count = int(df_marked["is_one_time"].sum())
 
@@ -470,19 +481,17 @@ def predict_all_horizons_multi(
 
     unique_days = int(daily_model.index.nunique()) if len(daily_model) else 0
 
-    # Cold start / small data
+    # Cold start / small data => calendar-month from daily fallback
     if unique_days < MIN_UNIQUE_DAYS_FOR_ML:
         predicted_remaining = float(fallback_day * remaining_days) if remaining_days > 0 else 0.0
         this_month_forecast = round(spent_so_far + predicted_remaining, 2)
 
         msg = "Using average (cold start)"
         if one_time_count > 0:
-            if ONE_TIME_USE_OR_RULE:
-                msg += f" - excluded {one_time_count} one-time tx (>= {floor_th:.0f} OR >= {mult_th:.0f})"
-            else:
-                msg += f" - excluded {one_time_count} one-time tx"
+            msg += f" - excluded {one_time_count} one-time tx (>= {floor_th:.0f} OR >= {mult_th:.0f})"
         return msg, float(fallback_day), float(fallback_week), float(this_month_forecast)
 
+    # Build ML features
     series_df, err = aggregate_expenses_spike_aware(df_model)
     if err:
         predicted_remaining = float(fallback_day * remaining_days) if remaining_days > 0 else 0.0
@@ -490,10 +499,7 @@ def predict_all_horizons_multi(
 
         msg = f"Using average ({err})"
         if one_time_count > 0:
-            if ONE_TIME_USE_OR_RULE:
-                msg += f" - excluded {one_time_count} one-time tx (>= {floor_th:.0f} OR >= {mult_th:.0f})"
-            else:
-                msg += f" - excluded {one_time_count} one-time tx"
+            msg += f" - excluded {one_time_count} one-time tx (>= {floor_th:.0f} OR >= {mult_th:.0f})"
         return msg, float(fallback_day), float(fallback_week), float(this_month_forecast)
 
     model = train_random_forest(series_df)
@@ -523,18 +529,15 @@ def predict_all_horizons_multi(
 
     msg = "ML used (one-time excluded)"
     if one_time_count > 0:
-        if ONE_TIME_USE_OR_RULE:
-            msg += f" - excluded {one_time_count} one-time tx (>= {floor_th:.0f} OR >= {mult_th:.0f})"
-        else:
-            msg += f" - excluded {one_time_count} one-time tx"
+        msg += f" - excluded {one_time_count} one-time tx (>= {floor_th:.0f} OR >= {mult_th:.0f})"
 
     return msg, float(next_day), float(next_week), float(this_month_forecast)
 
 
 # =========================
-# FASTAPI
+# FASTAPI (single app ✅)
 # =========================
-app = FastAPI(title="SmartBudget ML API", version="2.4.0")
+app = FastAPI(title="SmartBudget ML API", version="2.4.1")
 
 app.add_middleware(
     CORSMiddleware,
