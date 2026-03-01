@@ -1,9 +1,11 @@
-# smartbudget_ml_api.py (FULL - BEST corrected, single FastAPI app)
+# smartbudget_ml_api.py (FULL - corrected + safer anchor-month math)
 # ✅ One-time tx detection (>= RM300 OR >= typical_daily*mult) -> excludes from modeling
 # ✅ Small-data friendly heuristics
 # ✅ Calendar-month forecast using anchor_year/anchor_month:
 #    this_month = spent_so_far_in_that_month (REAL, includes one-time)
 #              + predicted_remaining_until_month_end (habit-only)
+# ✅ FIXED: if user selects a FUTURE month, remaining-days prediction starts at anchor_start
+#          (prevents predicting days outside the selected month)
 #
 # Run:
 #   uvicorn smartbudget_ml_api:app --host 0.0.0.0 --port 8000
@@ -27,9 +29,9 @@ MIN_UNIQUE_DAYS_FOR_ML = 30
 MIN_ROWS_AFTER_FE = 60
 
 ONE_TIME_MULTIPLIER = 5.0
-ONE_TIME_FLOOR = 300.0            # ✅ RM300+ means >= 300
+ONE_TIME_FLOOR = 300.0            # RM300+ means >= 300
 ONE_TIME_ONLY_IF_SINGLE = True
-ONE_TIME_USE_OR_RULE = True       # ✅ OR rule (>= floor OR >= multiplier threshold)
+ONE_TIME_USE_OR_RULE = True       # OR rule (>= floor OR >= multiplier threshold)
 
 SPIKE_MULTIPLIER_DEFAULT = 3.0
 WINSOR_MULTIPLIER = 5.0
@@ -38,7 +40,6 @@ MIN_DAYS_FOR_STRICT_SPIKES = 14
 RF_ESTIMATORS = 220
 RF_MAX_DEPTH = 14
 RANDOM_STATE = 42
-
 
 FEATURES = [
     "day_of_week", "is_weekend", "month", "day",
@@ -408,7 +409,7 @@ def predict_all_horizons_multi(
     """
     Returns: (message, next_day, next_week, next_month)
 
-    ✅ next_month = calendar-month forecast for anchor month:
+    next_month = calendar-month forecast for anchor month:
        spent_so_far (REAL, includes one-time)
        + predicted_remaining (habit-only)
     """
@@ -433,7 +434,7 @@ def predict_all_horizons_multi(
     # drop invalid
     raw = raw.dropna(subset=["date", "amount"])
 
-    # keep non-negative only (optional safety)
+    # keep positive only
     raw = raw[raw["amount"] > 0]
 
     if raw.empty or float(raw["amount"].sum()) == 0.0:
@@ -458,8 +459,11 @@ def predict_all_horizons_multi(
         raw[(raw["date"] >= anchor_start) & (raw["date"] <= spent_so_far_end)]["amount"].sum()
     )
 
-    # Remaining days in month from latest+1 -> anchor_end
-    start_pred = (latest + pd.Timedelta(days=1)).normalize()
+    # ✅ FIX: prediction start is inside the selected month
+    # - normally: day after latest transaction
+    # - but if selected month is FUTURE: start at anchor_start (not before it)
+    start_pred = max((latest + pd.Timedelta(days=1)).normalize(), anchor_start)
+
     if start_pred > anchor_end:
         remaining_days = 0
     else:
@@ -535,9 +539,9 @@ def predict_all_horizons_multi(
 
 
 # =========================
-# FASTAPI (single app ✅)
+# FASTAPI (single app)
 # =========================
-app = FastAPI(title="SmartBudget ML API", version="2.4.1")
+app = FastAPI(title="SmartBudget ML API", version="2.4.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -560,7 +564,7 @@ class PredictRequest(BaseModel):
     transactions: List[TransactionIn]
     days: int = Field(default=30, ge=1, le=365)
 
-    # ✅ supports your Flutter month view
+    # supports your Flutter month view
     anchor_year: Optional[int] = None
     anchor_month: Optional[int] = Field(default=None, ge=1, le=12)
 
