@@ -1,8 +1,9 @@
-# smartbudget_ml_api.py (FULL - corrected & small-data robust)
+# smartbudget_ml_api.py (FULL - improved & less strict for small data)
 # ✅ Detects large SINGLE transactions as "one-time"
 # ✅ Excludes one-time tx from prediction modeling (heuristic + ML)
 # ✅ Small-data friendly: spike rules AUTO-RELAX when history is short
-# ✅ One-time threshold is now ROBUST for small data (won't get distorted by 1 huge day)
+# ✅ FIXED: RM400 (>= RM300) will be detected as one-time even if typical_daily*5 is higher
+# ✅ More robust "typical daily" estimation for tiny datasets (won't be distorted by 1 huge day)
 # ✅ Clearer error messages
 #
 # Run:
@@ -22,15 +23,21 @@ from sklearn.ensemble import RandomForestRegressor
 # =========================
 # CONFIG (good defaults)
 # =========================
-MIN_UNIQUE_DAYS_FOR_ML = 30        # ML when user has >=30 unique SPENDING dates (after one-time removal)
+MIN_UNIQUE_DAYS_FOR_ML = 30        # use ML when user has >=30 unique dates (after one-time removal)
 MIN_ROWS_AFTER_FE = 60            # after feature engineering, need enough rows
 
 # One-time transaction detection (transaction-level)
 ONE_TIME_MULTIPLIER = 5.0         # one-time if tx_amount >= typical_daily * 5
-ONE_TIME_FLOOR = 301.0            # require >= RM300 too (prevents over-flagging)
+ONE_TIME_FLOOR = 301.0            # one-time if tx_amount >= RM300
 ONE_TIME_ONLY_IF_SINGLE = True    # only flag big single tx; not the whole day
 
+# ✅ KEY CHANGE:
+# If True: one-time if (>= FLOOR) OR (>= MULTIPLIER * typical_daily)
+# This makes RM400 become one-time because it passes FLOOR, even if multiplier rule is higher.
+ONE_TIME_USE_OR_RULE = True
+
 # Spike handling (daily-level for stability)
+# NOTE: spike rules are relaxed automatically for small histories (see _spike_multiplier_for_n)
 SPIKE_MULTIPLIER_DEFAULT = 3.0    # spike if daily > median * 3 (used when enough history)
 WINSOR_MULTIPLIER = 5.0           # cap daily for ML stability at median * 5
 MIN_DAYS_FOR_STRICT_SPIKES = 14   # before this, spike detection uses more relaxed multiplier
@@ -103,7 +110,7 @@ def _robust_estimate_small_sample(vals: np.ndarray) -> float:
     """
     Best estimate for 2..6 days:
       - Use median (robust)
-      - If >=4 points, drop extreme outliers using RELAXED multiplier
+      - If there are enough points (>=4), drop extreme outliers using RELAXED spike multiplier
       - Return median of remaining (or original median if everything removed)
     """
     s = pd.Series(vals.astype(float))
@@ -121,6 +128,7 @@ def _robust_estimate_small_sample(vals: np.ndarray) -> float:
 
     mult = 8.0
     filtered = s[s <= med * mult]
+
     if len(filtered) == 0:
         return med
     return float(filtered.median())
@@ -187,17 +195,14 @@ def _compute_spike_flags(daily: pd.Series) -> pd.Series:
 
 
 # =========================
-# ONE-TIME TRANSACTION DETECTION (ROBUST)
+# ONE-TIME TRANSACTION DETECTION (FIXED)
 # =========================
 
 def _robust_typical_daily(daily_total: pd.Series) -> float:
     """
     Robust 'typical daily' for one-time threshold:
-    - Works better for tiny history where 1 huge day can distort the median.
-    - Procedure:
-        1) median
-        2) remove extreme days > median*8 (relaxed)
-        3) recompute median on remaining (fallback to original median)
+    - Avoids being distorted by 1 huge day in small datasets.
+    - median -> trim days > median*8 -> median again (if enough remains)
     """
     if daily_total is None or daily_total.empty:
         return 0.0
@@ -209,42 +214,62 @@ def _robust_typical_daily(daily_total: pd.Series) -> float:
         nz = s[s > 0]
         return float(nz.median()) if len(nz) else 0.0
 
-    # relaxed trimming (only removes truly extreme days)
     trimmed = s[s <= base_med * 8.0]
+    # keep trimming only if we still have enough points
     if len(trimmed) >= max(3, int(0.6 * len(s))):
         return float(trimmed.median())
 
-    # fallback
     return base_med
 
 
 def mark_one_time_transactions(raw: pd.DataFrame) -> Tuple[pd.DataFrame, float]:
     """
     Marks large SINGLE transactions as one-time.
-    Threshold = max(ONE_TIME_FLOOR, typical_daily_total * ONE_TIME_MULTIPLIER)
 
-    typical_daily_total is computed robustly to avoid being distorted by 1 huge day
-    in small datasets.
+    Two thresholds:
+      floor_th = ONE_TIME_FLOOR
+      mult_th  = typical_daily_total * ONE_TIME_MULTIPLIER
+
+    If ONE_TIME_USE_OR_RULE:
+      one-time if amount >= floor_th OR amount >= mult_th
+    Else (old strict behavior):
+      one-time if amount >= max(floor_th, mult_th)
 
     Returns:
       df_marked with column: is_one_time (bool)
-      threshold used (float)
+      value used for message display (float) -> we return floor_th (because OR-rule has 2 thresholds)
     """
     df = raw.copy()
 
     daily_total = _daily_series(df)
     typical_daily = _robust_typical_daily(daily_total)
 
-    threshold = max(float(ONE_TIME_FLOOR), float(typical_daily * ONE_TIME_MULTIPLIER))
+    floor_th = float(ONE_TIME_FLOOR)
+    mult_th = float(typical_daily * ONE_TIME_MULTIPLIER)
+
     df["is_one_time"] = False
 
     if ONE_TIME_ONLY_IF_SINGLE:
-        df.loc[df["amount"] >= threshold, "is_one_time"] = True
+        if ONE_TIME_USE_OR_RULE:
+            # ✅ LESS STRICT: RM400 becomes one-time because it passes floor_th (>= RM300)
+            df.loc[(df["amount"] >= floor_th) | (df["amount"] >= mult_th), "is_one_time"] = True
+        else:
+            threshold = max(floor_th, mult_th)
+            df.loc[df["amount"] >= threshold, "is_one_time"] = True
     else:
-        big_days = daily_total[daily_total >= threshold].index
+        # Day-level mode (rarely used)
+        if ONE_TIME_USE_OR_RULE:
+            big_days = daily_total[(daily_total >= floor_th) | (daily_total >= mult_th)].index
+        else:
+            threshold = max(floor_th, mult_th)
+            big_days = daily_total[daily_total >= threshold].index
         df.loc[df["date"].isin(big_days), "is_one_time"] = True
 
-    return df, float(threshold)
+    # for message display:
+    # - if strict mode, show the computed max threshold
+    # - if OR mode, show floor + mult threshold (we return floor, but message will show both)
+    display = max(floor_th, mult_th) if not ONE_TIME_USE_OR_RULE else floor_th
+    return df, float(display)
 
 
 # =========================
@@ -274,24 +299,18 @@ def aggregate_expenses_spike_aware(df_model: pd.DataFrame) -> Tuple[pd.DataFrame
     full_range = pd.date_range(daily_raw.index.min(), daily_raw.index.max(), freq="D")
     series_df = daily_raw.reindex(full_range, fill_value=0.0).to_frame("daily_expense")
 
-    # spike flags based on raw daily (before winsorization)
     series_df["is_spike"] = _compute_spike_flags(series_df["daily_expense"])
-
-    # winsorize target for stable training + recursion
     series_df["daily_expense"] = _winsorize_daily(series_df["daily_expense"])
 
-    # calendar
     series_df["day_of_week"] = series_df.index.dayofweek
     series_df["is_weekend"] = series_df["day_of_week"].isin([5, 6]).astype(int)
     series_df["month"] = series_df.index.month
     series_df["day"] = series_df.index.day
 
-    # lags
     series_df["lag_1"] = series_df["daily_expense"].shift(1)
     series_df["lag_2"] = series_df["daily_expense"].shift(2)
     series_df["lag_3"] = series_df["daily_expense"].shift(3)
 
-    # rollings (past only)
     series_df["rolling_mean_3"] = series_df["daily_expense"].rolling(3).mean().shift(1)
     series_df["rolling_std_3"] = series_df["daily_expense"].rolling(3).std(ddof=0).shift(1)
 
@@ -300,7 +319,6 @@ def aggregate_expenses_spike_aware(df_model: pd.DataFrame) -> Tuple[pd.DataFrame
 
     series_df["cumsum_7"] = series_df["daily_expense"].rolling(7).sum().shift(1)
 
-    # spike-aware features (past only)
     series_df["is_spike_prev"] = series_df["is_spike"].shift(1).fillna(0).astype(int)
     series_df["spike_count_7"] = series_df["is_spike"].rolling(7).sum().shift(1).fillna(0).astype(int)
     series_df["spike_count_30"] = series_df["is_spike"].rolling(30).sum().shift(1).fillna(0).astype(int)
@@ -411,7 +429,7 @@ def predict_all_horizons_multi(transactions_df: pd.DataFrame, days: int = 30):
 
     ✅ One-time tx removed from modeling (laptop case)
     ✅ Small-data friendly heuristic
-    ✅ ML uses last 6 months based on latest date in payload
+    ✅ ML uses last 6 months based on latest date
     """
     if transactions_df is None or transactions_df.empty:
         return "No expense data available.", 0.0, 0.0, 0.0
@@ -436,7 +454,8 @@ def predict_all_horizons_multi(transactions_df: pd.DataFrame, days: int = 30):
     df6 = raw[raw["date"] >= cutoff]
     df = df6 if len(df6) >= 10 else raw
 
-    df_marked, one_time_threshold = mark_one_time_transactions(df)
+    df_marked, display_threshold = mark_one_time_transactions(df)
+
     df_model = df_marked[df_marked["is_one_time"] == False].copy()
     one_time_count = int(df_marked["is_one_time"].sum())
 
@@ -448,14 +467,30 @@ def predict_all_horizons_multi(transactions_df: pd.DataFrame, days: int = 30):
     if unique_days < MIN_UNIQUE_DAYS_FOR_ML:
         msg = "Using average (cold start)"
         if one_time_count > 0:
-            msg += f" - excluded {one_time_count} one-time tx (>= {one_time_threshold:.0f})"
+            # if OR-rule, show both thresholds for clarity
+            if ONE_TIME_USE_OR_RULE:
+                # compute again for message only (cheap)
+                daily_total = _daily_series(df)
+                typical_daily = _robust_typical_daily(daily_total)
+                floor_th = float(ONE_TIME_FLOOR)
+                mult_th = float(typical_daily * ONE_TIME_MULTIPLIER)
+                msg += f" - excluded {one_time_count} one-time tx (>= {floor_th:.0f} OR >= {mult_th:.0f})"
+            else:
+                msg += f" - excluded {one_time_count} one-time tx (>= {display_threshold:.0f})"
         return msg, fallback_day, fallback_week, fallback_month
 
     series_df, err = aggregate_expenses_spike_aware(df_model)
     if err:
         msg = f"Using average ({err})"
         if one_time_count > 0:
-            msg += f" - excluded {one_time_count} one-time tx (>= {one_time_threshold:.0f})"
+            if ONE_TIME_USE_OR_RULE:
+                daily_total = _daily_series(df)
+                typical_daily = _robust_typical_daily(daily_total)
+                floor_th = float(ONE_TIME_FLOOR)
+                mult_th = float(typical_daily * ONE_TIME_MULTIPLIER)
+                msg += f" - excluded {one_time_count} one-time tx (>= {floor_th:.0f} OR >= {mult_th:.0f})"
+            else:
+                msg += f" - excluded {one_time_count} one-time tx (>= {display_threshold:.0f})"
         return msg, fallback_day, fallback_week, fallback_month
 
     model = train_random_forest(series_df)
@@ -464,7 +499,14 @@ def predict_all_horizons_multi(transactions_df: pd.DataFrame, days: int = 30):
     if preds_df.empty:
         msg = "Using average (prediction empty)"
         if one_time_count > 0:
-            msg += f" - excluded {one_time_count} one-time tx (>= {one_time_threshold:.0f})"
+            if ONE_TIME_USE_OR_RULE:
+                daily_total = _daily_series(df)
+                typical_daily = _robust_typical_daily(daily_total)
+                floor_th = float(ONE_TIME_FLOOR)
+                mult_th = float(typical_daily * ONE_TIME_MULTIPLIER)
+                msg += f" - excluded {one_time_count} one-time tx (>= {floor_th:.0f} OR >= {mult_th:.0f})"
+            else:
+                msg += f" - excluded {one_time_count} one-time tx (>= {display_threshold:.0f})"
         return msg, fallback_day, fallback_week, fallback_month
 
     next_day = round(float(preds_df.iloc[0]["daily_expense_pred"]), 2)
@@ -473,7 +515,14 @@ def predict_all_horizons_multi(transactions_df: pd.DataFrame, days: int = 30):
 
     msg = "ML used (one-time excluded)"
     if one_time_count > 0:
-        msg += f" - excluded {one_time_count} one-time tx (>= {one_time_threshold:.0f})"
+        if ONE_TIME_USE_OR_RULE:
+            daily_total = _daily_series(df)
+            typical_daily = _robust_typical_daily(daily_total)
+            floor_th = float(ONE_TIME_FLOOR)
+            mult_th = float(typical_daily * ONE_TIME_MULTIPLIER)
+            msg += f" - excluded {one_time_count} one-time tx (>= {floor_th:.0f} OR >= {mult_th:.0f})"
+        else:
+            msg += f" - excluded {one_time_count} one-time tx (>= {display_threshold:.0f})"
 
     return msg, next_day, next_week, next_month
 
