@@ -431,9 +431,8 @@ def predict_all_horizons_multi(
 
     this_month_forecast = round(spent_so_far + predicted_remaining, 2)
 
-    msg = "ML used (one-time excluded)"
-    if one_time_count > 0:
-        msg += f" - excluded {one_time_count} one-time tx (>= {floor_th:.0f})"
+    msg = "ML used"
+
 
     return msg, float(next_day), float(next_week), float(this_month_forecast)
 
