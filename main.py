@@ -389,8 +389,7 @@ def predict_all_horizons_multi(
         this_month_forecast = round(spent_so_far + predicted_remaining, 2)
 
         msg = "Using average"
-        if one_time_count > 0:
-            msg += f" - excluded {one_time_count} one-time tx (>= {floor_th:.0f})"
+
         return msg, float(fallback_day), float(fallback_week), float(this_month_forecast)
 
     # ✅ ML FEATURES (SIMPLE ENGINE)
@@ -400,8 +399,7 @@ def predict_all_horizons_multi(
         this_month_forecast = round(spent_so_far + predicted_remaining, 2)
 
         msg = f"Using average"
-        if one_time_count > 0:
-            msg += f" - excluded {one_time_count} one-time tx (>= {floor_th:.0f})"
+      
         return msg, float(fallback_day), float(fallback_week), float(this_month_forecast)
 
     model, features = train_random_forest_simple(series_df)
@@ -418,8 +416,7 @@ def predict_all_horizons_multi(
         this_month_forecast = round(spent_so_far + predicted_remaining, 2)
 
         msg = "Using average"
-        if one_time_count > 0:
-            msg += f" - excluded {one_time_count} one-time tx (>= {floor_th:.0f})"
+  
         return msg, float(fallback_day), float(fallback_week), float(this_month_forecast)
 
     next_day = round(float(preds_df.iloc[0]["daily_expense_pred"]), 2)
