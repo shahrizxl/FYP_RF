@@ -289,7 +289,7 @@ def predict_all_horizons_multi(
                 preds_df = predict_future(model, features, series_df, days=needed_days)
 
                 if not preds_df.empty:
-                    msg = "Machine Learning model used: RandomForest (historical fit)."
+                    msg = "RandomForest-based forecast"
                     real_tomorrow = today_ts + pd.Timedelta(days=1)
                     future_preds = preds_df[preds_df.index >= real_tomorrow]
 
