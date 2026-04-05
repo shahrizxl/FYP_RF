@@ -362,3 +362,7 @@ def predict(req: PredictRequest):
         "next_month": float(next_month),
         "metrics": metrics_list
     }
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
