@@ -207,7 +207,7 @@ def train_and_evaluate_rf(
     min_train_size = max(10, len(series_df) // (n_splits + 1))
 
     # Choose split strategy based on available data
-    tscv = TimeSeriesSplit(n_splits=n_splits, min_samples_leaf=min_train_size)
+    tscv = TimeSeriesSplit(n_splits=n_splits)
     splits = list(tscv.split(X_all))
 
     if len(splits) == 0 or len(splits[-1][1]) < 5:
