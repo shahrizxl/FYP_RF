@@ -14,7 +14,7 @@ from sklearn.model_selection import TimeSeriesSplit
 # =========================
 # CONFIG
 # =========================
-MIN_UNIQUE_DAYS_FOR_ML = 30
+MIN_UNIQUE_DAYS_FOR_ML = 60
 
 # FIX 1: ONE_TIME_FLOOR used to silently drop ALL transactions >= RM300 from training,
 # including recurring large costs like rent, bills, salary deductions.
@@ -233,7 +233,12 @@ def train_and_evaluate_rf(
         X_tr, y_tr = X_all.iloc[train_idx], y_all.iloc[train_idx]
         X_te, y_te = X_all.iloc[test_idx], y_all.iloc[test_idx]
 
-        fold_model = RandomForestRegressor(n_estimators=100, max_depth=12, random_state=42)
+        fold_model = RandomForestRegressor(
+            n_estimators=50,
+            max_depth=8,
+            random_state=42,
+            n_jobs=-1
+        )
         fold_model.fit(X_tr, y_tr)
 
         preds = fold_model.predict(X_te)
@@ -262,7 +267,12 @@ def train_and_evaluate_rf(
     }])
 
     # Retrain on full data for final prediction
-    final_model = RandomForestRegressor(n_estimators=300, max_depth=12, random_state=42)
+    final_model = RandomForestRegressor(
+        n_estimators=50,
+        max_depth=8,
+        random_state=42,
+        n_jobs=-1
+    )
     final_model.fit(X_all, y_all)
 
     return final_model, feature_cols, metrics_df
@@ -427,7 +437,10 @@ def predict_all_horizons_multi(
                 last_hist = series_df.index[-1].normalize()
                 days_to_anchor_end = max(0, int((anchor_end - last_hist).days))
                 days_to_next_week = max(0, int((today_ts + pd.Timedelta(days=7) - last_hist).days))
-                needed_days = max(days, days_to_anchor_end, days_to_next_week)
+                needed_days = min(
+                    90,
+                    max(days, days_to_anchor_end, days_to_next_week)
+                )
 
                 # FIX 6 (applied): predict_future now uses a clean history buffer
                 preds_df = predict_future(model, features, series_df, days=needed_days)
