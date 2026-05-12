@@ -355,7 +355,7 @@ def predict_all_horizons_multi(
     raw["date"] = pd.to_datetime(raw["date"], errors="coerce").dt.normalize()
     raw["amount"] = pd.to_numeric(raw["amount"], errors="coerce")
     raw = raw.dropna(subset=["date", "amount"])
-    raw = raw[raw["amount"] > 0]
+    raw["amount"] = raw["amount"].abs()
 
     if raw.empty:
         return "No expense data available.", 0.0, 0.0, 0.0, []
@@ -483,7 +483,7 @@ class TransactionIn(BaseModel):
     # FIX 7: amount must be > 0. Previously TransactionIn allowed any float
     # including negative values. Negative income entries could corrupt the model
     # since the backend only filters after coercion, not at the schema level.
-    amount: float = Field(..., gt=0, description="Transaction amount, must be positive")
+    amount: float = Field(..., description="Transaction amount")
     type: Optional[str] = Field(default="expense")
     description: Optional[str] = None
     category: Optional[str] = None
