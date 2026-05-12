@@ -6,16 +6,24 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import TimeSeriesSplit
 
 # =========================
 # CONFIG
 # =========================
 MIN_UNIQUE_DAYS_FOR_ML = 30
+
+# FIX 1: ONE_TIME_FLOOR used to silently drop ALL transactions >= RM300 from training,
+# including recurring large costs like rent, bills, salary deductions.
+# Solution: only mark a transaction as one-time if it is BOTH >= floor AND its
+# category/description has appeared fewer than MIN_RECURRENCE times in the dataset.
+# This preserves genuine recurring large expenses in the training data.
 ONE_TIME_FLOOR = 300.0
-ONE_TIME_ONLY_IF_SINGLE = True
+MIN_RECURRENCE_TO_KEEP = 2        # if same category appears >= this many times, it's recurring
+ONE_TIME_ONLY_IF_SINGLE = True    # legacy flag, kept for backward compat but logic improved below
 
 # =========================
 # BASIC HELPERS & SPIKE SAFE
@@ -48,13 +56,24 @@ def _robust_estimate_small_sample(vals: np.ndarray) -> float:
         return med
     return float(filtered.median())
 
-def heuristic_v3_spike_safe(daily: pd.Series) -> Tuple[float, float, float]:
+# FIX 2: heuristic_v3_spike_safe now accepts an explicit anchor parameter.
+# Previously it always used daily.index.max() as the anchor, which pointed
+# to the last date in whatever dataset was passed — wrong when the training
+# window ends months before the target month. Now the caller passes the real
+# anchor (anchor_end of the target month or training window end).
+def heuristic_v3_spike_safe(
+    daily: pd.Series,
+    anchor: Optional[pd.Timestamp] = None
+) -> Tuple[float, float, float]:
     if daily is None or daily.empty:
         return 0.0, 0.0, 0.0
 
     daily = daily.sort_index().astype(float)
     unique_days = int(daily.index.nunique())
-    anchor = daily.index.max()
+
+    # Use explicit anchor if given, otherwise fall back to last date in series.
+    effective_anchor: pd.Timestamp = anchor if anchor is not None else daily.index.max()
+    effective_anchor = pd.Timestamp(effective_anchor).normalize()
 
     if unique_days == 1:
         x = float(daily.iloc[0])
@@ -64,28 +83,46 @@ def heuristic_v3_spike_safe(daily: pd.Series) -> Tuple[float, float, float]:
         est = _robust_estimate_small_sample(daily.values)
         return round(est, 2), round(est * 7, 2), round(est * 30, 2)
 
-    avg7 = _avg_calendar_window(daily, anchor, 7)
+    avg7 = _avg_calendar_window(daily, effective_anchor, 7)
 
     if unique_days >= 30:
-        avg30 = _avg_calendar_window(daily, anchor, 30)
+        avg30 = _avg_calendar_window(daily, effective_anchor, 30)
         return round(avg7, 2), round(avg7 * 7, 2), round(avg30 * 30, 2)
 
     return round(avg7, 2), round(avg7 * 7, 2), round(avg7 * 30, 2)
 
+
 def mark_one_time_transactions(raw: pd.DataFrame) -> Tuple[pd.DataFrame, Tuple[float, float]]:
+    """
+    FIX 1 (continued): Improved one-time detection.
+    A transaction is only flagged as one-time if:
+      - Its amount >= ONE_TIME_FLOOR, AND
+      - Its category has fewer than MIN_RECURRENCE_TO_KEEP occurrences in the dataset.
+    This preserves large recurring costs (rent, insurance, loan repayments) in training.
+    """
     df = raw.copy()
     floor_th = float(ONE_TIME_FLOOR)
     df["is_one_time"] = False
 
-    # RM300-only rule (single transaction >= floor)
-    if ONE_TIME_ONLY_IF_SINGLE:
-        df.loc[df["amount"] >= floor_th, "is_one_time"] = True
+    big_mask = df["amount"] >= floor_th
+    if not big_mask.any():
+        return df, (floor_th, 0.0)
+
+    # Count how many times each category appears among large transactions
+    if "category" in df.columns:
+        cat_counts = df.loc[big_mask, "category"].fillna("unknown").str.strip().str.lower().value_counts()
+        rare_cats = set(cat_counts[cat_counts < MIN_RECURRENCE_TO_KEEP].index)
+        # Mark as one-time only if large AND in a rare (non-recurring) category
+        df.loc[
+            big_mask & df["category"].fillna("unknown").str.strip().str.lower().isin(rare_cats),
+            "is_one_time"
+        ] = True
     else:
-        daily_total = _daily_series(df)
-        big_days = daily_total[daily_total >= floor_th].index
-        df.loc[df["date"].isin(big_days), "is_one_time"] = True
+        # No category info — fall back to original simple rule
+        df.loc[big_mask, "is_one_time"] = True
 
     return df, (floor_th, 0.0)
+
 
 # =========================
 # TRAINING WINDOW (FIXED)
@@ -99,6 +136,7 @@ def _prev_six_full_months_window(anchor_start: pd.Timestamp) -> Tuple[pd.Timesta
     train_start = (anchor_start - pd.DateOffset(months=6)).replace(day=1)
     train_end = anchor_start - pd.Timedelta(days=1)
     return train_start, train_end
+
 
 # ======================================================
 # EXPANDED ML ENGINE & EVALUATION
@@ -136,58 +174,151 @@ def aggregate_expenses(df: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[str]]:
 
     return series_df, None
 
-def train_rf_only(series_df: pd.DataFrame) -> Tuple[RandomForestRegressor, List[str]]:
+
+def train_rf_only(
+    series_df: pd.DataFrame,
+) -> Tuple[RandomForestRegressor, List[str]]:
+    """Train RandomForest on the FULL series_df (used after evaluation confirms quality)."""
     X = series_df.drop(columns=["daily_expense"])
     y = series_df["daily_expense"]
     model = RandomForestRegressor(n_estimators=300, max_depth=12, random_state=42)
     model.fit(X, y)
     return model, X.columns.tolist()
 
-def evaluate_rf(model: RandomForestRegressor, X_eval: pd.DataFrame, y_eval: pd.Series, fallback_tol: float = 1.2) -> pd.DataFrame:
-    baseline = np.full_like(y_eval, float(np.mean(y_eval)), dtype=float)
-    baseline_mae = mean_absolute_error(y_eval, baseline)
 
-    preds = model.predict(X_eval)
-    mae = mean_absolute_error(y_eval, preds)
-    rmse = np.sqrt(mean_squared_error(y_eval, preds))
-    r2 = r2_score(y_eval, preds)
+# FIX 5: Proper time-series cross-validation instead of evaluating on training data.
+# Previously evaluate_rf() received the same data the model was trained on, so
+# MAE was always near-zero and accepted was always True — no real quality gate.
+# Now we use TimeSeriesSplit (walk-forward) to get honest out-of-sample metrics.
+def train_and_evaluate_rf(
+    series_df: pd.DataFrame,
+    fallback_tol: float = 1.2,
+    n_splits: int = 3,
+) -> Tuple[Optional[RandomForestRegressor], List[str], pd.DataFrame]:
+    """
+    Walk-forward cross-validation, then retrain on full data.
+    Returns (final_model, features, metrics_df).
+    If there's not enough data for CV, falls back to a simple 80/20 temporal split.
+    """
+    feature_cols = [c for c in series_df.columns if c != "daily_expense"]
+    X_all = series_df[feature_cols]
+    y_all = series_df["daily_expense"]
 
-    accepted = (mae <= baseline_mae * fallback_tol) or (r2 > 0)
+    min_train_size = max(10, len(series_df) // (n_splits + 1))
 
-    return pd.DataFrame([{
+    # Choose split strategy based on available data
+    tscv = TimeSeriesSplit(n_splits=n_splits, min_samples_leaf=min_train_size)
+    splits = list(tscv.split(X_all))
+
+    if len(splits) == 0 or len(splits[-1][1]) < 5:
+        # Not enough data for n_splits — use a simple 80/20 temporal split
+        split_idx = int(len(series_df) * 0.8)
+        if split_idx < 5 or (len(series_df) - split_idx) < 3:
+            # Too small even for 80/20 — skip evaluation, accept as-is
+            model = RandomForestRegressor(n_estimators=300, max_depth=12, random_state=42)
+            model.fit(X_all, y_all)
+            metrics_df = pd.DataFrame([{
+                "model": "RandomForest",
+                "mae": 0.0, "rmse": 0.0, "r2": 0.0,
+                "accepted": True,
+                "note": "Too little data for CV — accepted without evaluation"
+            }])
+            return model, feature_cols, metrics_df
+        splits = [([*range(split_idx)], [*range(split_idx, len(series_df))])]
+
+    all_mae, all_rmse, all_r2 = [], [], []
+    all_baseline_mae = []
+
+    for train_idx, test_idx in splits:
+        X_tr, y_tr = X_all.iloc[train_idx], y_all.iloc[train_idx]
+        X_te, y_te = X_all.iloc[test_idx], y_all.iloc[test_idx]
+
+        fold_model = RandomForestRegressor(n_estimators=100, max_depth=12, random_state=42)
+        fold_model.fit(X_tr, y_tr)
+
+        preds = fold_model.predict(X_te)
+        baseline = np.full(len(y_te), float(np.mean(y_tr)))
+
+        all_mae.append(mean_absolute_error(y_te, preds))
+        all_rmse.append(float(np.sqrt(mean_squared_error(y_te, preds))))
+        all_r2.append(r2_score(y_te, preds))
+        all_baseline_mae.append(mean_absolute_error(y_te, baseline))
+
+    avg_mae = float(np.mean(all_mae))
+    avg_rmse = float(np.mean(all_rmse))
+    avg_r2 = float(np.mean(all_r2))
+    avg_baseline_mae = float(np.mean(all_baseline_mae))
+
+    accepted = (avg_mae <= avg_baseline_mae * fallback_tol) or (avg_r2 > 0)
+
+    metrics_df = pd.DataFrame([{
         "model": "RandomForest",
-        "mae": float(mae),
-        "rmse": float(rmse),
-        "r2": float(r2),
-        "accepted": bool(accepted)
+        "mae": round(avg_mae, 4),
+        "rmse": round(avg_rmse, 4),
+        "r2": round(avg_r2, 4),
+        "baseline_mae": round(avg_baseline_mae, 4),
+        "accepted": bool(accepted),
+        "cv_folds": len(splits),
     }])
 
-def predict_future(model: RandomForestRegressor, features: List[str], series_df: pd.DataFrame, days: int = 30) -> pd.DataFrame:
+    # Retrain on full data for final prediction
+    final_model = RandomForestRegressor(n_estimators=300, max_depth=12, random_state=42)
+    final_model.fit(X_all, y_all)
+
+    return final_model, feature_cols, metrics_df
+
+
+# FIX 6: predict_future now uses a dedicated history buffer (list) for lag/rolling
+# computations instead of writing back into the original series_df DataFrame.
+# Previously, temp_df.loc[d] would append predicted values into the full DataFrame
+# including all feature columns, causing rolling_std and rolling_mean to mix
+# real historical values with predicted values in an uncontrolled way.
+def predict_future(
+    model: RandomForestRegressor,
+    features: List[str],
+    series_df: pd.DataFrame,
+    days: int = 30,
+) -> pd.DataFrame:
     if series_df is None or series_df.empty:
         return pd.DataFrame(columns=["daily_expense_pred"])
 
     last_date = series_df.index[-1]
     future_dates = pd.date_range(last_date + timedelta(days=1), periods=days, freq="D")
-    temp_df = series_df.copy()
-    predictions = []
+
+    # Keep only the raw daily_expense history for rolling computations.
+    # We append predicted values here as we go — cleanly separated from series_df.
+    history: List[float] = list(series_df["daily_expense"].values)
+    predictions: List[float] = []
 
     for d in future_dates:
-        tail7 = temp_df["daily_expense"].tail(7)
-        tail3 = temp_df["daily_expense"].tail(3)
+        n = len(history)
+
+        lag1 = history[-1] if n >= 1 else 0.0
+        lag2 = history[-2] if n >= 2 else 0.0
+        lag3 = history[-3] if n >= 3 else 0.0
+
+        tail3 = history[-3:] if n >= 3 else history
+        tail7 = history[-7:] if n >= 7 else history
+
+        mean3 = float(np.mean(tail3)) if tail3 else 0.0
+        std3  = float(np.std(tail3, ddof=0)) if len(tail3) > 1 else 0.0
+        mean7 = float(np.mean(tail7)) if tail7 else 0.0
+        std7  = float(np.std(tail7, ddof=0)) if len(tail7) > 1 else 0.0
+        sum7  = float(np.sum(tail7)) if tail7 else 0.0
 
         row = {
             "day_of_week": d.dayofweek,
             "is_weekend": int(d.dayofweek in [5, 6]),
             "month": d.month,
             "day": d.day,
-            "lag_1": float(temp_df["daily_expense"].iloc[-1]) if len(temp_df) >= 1 else 0.0,
-            "lag_2": float(temp_df["daily_expense"].iloc[-2]) if len(temp_df) >= 2 else 0.0,
-            "lag_3": float(temp_df["daily_expense"].iloc[-3]) if len(temp_df) >= 3 else 0.0,
-            "rolling_mean_3": float(tail3.mean()) if len(tail3) else 0.0,
-            "rolling_std_3": float(tail3.std(ddof=0)) if len(tail3) > 1 else 0.0,
-            "rolling_mean_7": float(tail7.mean()) if len(tail7) else 0.0,
-            "rolling_std_7": float(tail7.std(ddof=0)) if len(tail7) > 1 else 0.0,
-            "cumsum_7": float(tail7.sum()) if len(tail7) else 0.0
+            "lag_1": lag1,
+            "lag_2": lag2,
+            "lag_3": lag3,
+            "rolling_mean_3": mean3,
+            "rolling_std_3": std3,
+            "rolling_mean_7": mean7,
+            "rolling_std_7": std7,
+            "cumsum_7": sum7,
         }
 
         X_pred = pd.DataFrame([row])
@@ -198,9 +329,10 @@ def predict_future(model: RandomForestRegressor, features: List[str], series_df:
 
         pred = max(0.0, float(model.predict(X_pred)[0]))
         predictions.append(pred)
-        temp_df.loc[d, "daily_expense"] = pred
+        history.append(pred)  # feed clean prediction into history buffer
 
     return pd.DataFrame({"daily_expense_pred": predictions}, index=future_dates)
+
 
 # =========================
 # ORCHESTRATION (MERGED CALENDAR + ML)
@@ -209,8 +341,9 @@ def predict_all_horizons_multi(
     transactions_df: pd.DataFrame,
     days: int = 30,
     anchor_year: Optional[int] = None,
-    anchor_month: Optional[int] = None
-):
+    anchor_month: Optional[int] = None,
+) -> Tuple[str, float, float, float, List[Dict[str, Any]]]:
+
     if transactions_df is None or transactions_df.empty:
         return "No expense data available.", 0.0, 0.0, 0.0, []
 
@@ -230,7 +363,7 @@ def predict_all_horizons_multi(
     today_ts = pd.Timestamp(date.today()).normalize()
     latest = raw["date"].max()
 
-    # anchor month selection
+    # Anchor month selection
     if anchor_year is not None and anchor_month is not None:
         ay, am = int(anchor_year), int(anchor_month)
     else:
@@ -240,18 +373,23 @@ def predict_all_horizons_multi(
     anchor_start = pd.Timestamp(date(ay, am, 1))
     anchor_end = pd.Timestamp(date(ay, am, last_day))
 
+    # FIX 3 & 4: Cleaner spent_so_far and remaining_days calculation.
+    # For a past month, clip to anchor_end (not today) so we always get the full month's spend.
+    # For current/future month, clip to today so we don't count days that haven't happened.
+    actual_end = min(today_ts, anchor_end)
     spent_so_far = float(
-        raw[(raw["date"] >= anchor_start) & (raw["date"] <= min(today_ts, anchor_end))]["amount"].sum()
+        raw[(raw["date"] >= anchor_start) & (raw["date"] <= actual_end)]["amount"].sum()
     )
 
+    # Remaining days = days from tomorrow (or anchor_start if future month) to anchor_end.
     start_pred = max(today_ts + pd.Timedelta(days=1), anchor_start)
-    remaining_days = 0 if start_pred > anchor_end else int((anchor_end - start_pred).days) + 1
+    remaining_days = max(0, int((anchor_end - start_pred).days) + 1) if start_pred <= anchor_end else 0
 
-    # ✅ FIX: training data based on anchor month (previous 6 full months)
+    # Training window: 6 full months before the anchor month
     train_start, train_end = _prev_six_full_months_window(anchor_start)
     df6_anchor = raw[(raw["date"] >= train_start) & (raw["date"] <= train_end)]
 
-    # fallback safety if too small
+    # Fallback safety: if window is too small, use latest 6 months of available data
     if len(df6_anchor) >= 10:
         df = df6_anchor
     else:
@@ -263,7 +401,12 @@ def predict_all_horizons_multi(
     df_model = df_marked[~df_marked["is_one_time"]].copy()
 
     daily_model = _daily_series(df_model) if not df_model.empty else pd.Series(dtype=float)
-    fallback_day, fallback_week, _ = heuristic_v3_spike_safe(daily_model)
+
+    # FIX 2 (applied): pass train_end as the anchor so avg7/avg30 look at the
+    # correct calendar window (end of training period), not an arbitrary last date.
+    heuristic_anchor = pd.Timestamp(train_end).normalize() if not daily_model.empty else None
+    fallback_day, fallback_week, _ = heuristic_v3_spike_safe(daily_model, anchor=heuristic_anchor)
+
     unique_days = int(daily_model.index.nunique()) if len(daily_model) else 0
 
     next_day = float(fallback_day)
@@ -274,18 +417,19 @@ def predict_all_horizons_multi(
 
     if unique_days >= MIN_UNIQUE_DAYS_FOR_ML:
         series_df, err = aggregate_expenses(df_model)
-        if not err:
-            model, features = train_rf_only(series_df)
+        if not err and series_df is not None and not series_df.empty:
 
-            metrics_df = evaluate_rf(model, series_df[features], series_df["daily_expense"])
+            # FIX 5 (applied): train_and_evaluate_rf uses walk-forward CV for honest metrics
+            model, features, metrics_df = train_and_evaluate_rf(series_df)
             metrics_list = metrics_df.to_dict(orient="records")
 
-            if bool(metrics_df.iloc[0]["accepted"]):
+            if model is not None and bool(metrics_df.iloc[0]["accepted"]):
                 last_hist = series_df.index[-1].normalize()
                 days_to_anchor_end = max(0, int((anchor_end - last_hist).days))
                 days_to_next_week = max(0, int((today_ts + pd.Timedelta(days=7) - last_hist).days))
                 needed_days = max(days, days_to_anchor_end, days_to_next_week)
 
+                # FIX 6 (applied): predict_future now uses a clean history buffer
                 preds_df = predict_future(model, features, series_df, days=needed_days)
 
                 if not preds_df.empty:
@@ -298,46 +442,75 @@ def predict_all_horizons_multi(
                         next_week = round(float(future_preds.head(7)["daily_expense_pred"].sum()), 2)
 
                     if remaining_days > 0:
-                        preds_in_month = preds_df.loc[(preds_df.index >= start_pred) & (preds_df.index <= anchor_end)]
+                        preds_in_month = preds_df.loc[
+                            (preds_df.index >= start_pred) & (preds_df.index <= anchor_end)
+                        ]
                         predicted_remaining = float(preds_in_month["daily_expense_pred"].sum())
             else:
                 msg = "ML model not reliable (failed MAE/R2). Using averages."
 
     this_month_forecast = round(spent_so_far + predicted_remaining, 2)
 
-    # Past month = show actual total
+    # Past month: show the actual total spend (not a forecast)
     if anchor_end < today_ts:
-        msg = "Past month - showing actual total"
-        actual = float(raw[(raw["date"] >= anchor_start) & (raw["date"] <= anchor_end)]["amount"].sum())
+        msg = "Past month — showing actual total"
+        actual = float(
+            raw[(raw["date"] >= anchor_start) & (raw["date"] <= anchor_end)]["amount"].sum()
+        )
         this_month_forecast = round(actual, 2)
+        # next_day and next_week remain as ML/heuristic estimates — they are still
+        # useful as a baseline for how much the user typically spends per day/week.
 
     return msg, next_day, next_week, this_month_forecast, metrics_list
+
 
 # =========================
 # FASTAPI
 # =========================
-app = FastAPI(title="SmartBudget ML API", version="3.0")
+app = FastAPI(title="SmartBudget ML API", version="3.1")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
+
 
 class TransactionIn(BaseModel):
     date: str = Field(..., description="ISO date string")
-    amount: float
+    # FIX 7: amount must be > 0. Previously TransactionIn allowed any float
+    # including negative values. Negative income entries could corrupt the model
+    # since the backend only filters after coercion, not at the schema level.
+    amount: float = Field(..., gt=0, description="Transaction amount, must be positive")
     type: Optional[str] = Field(default="expense")
     description: Optional[str] = None
     category: Optional[str] = None
 
+    @field_validator("date")
+    @classmethod
+    def validate_date(cls, v: str) -> str:
+        try:
+            pd.Timestamp(v)
+        except Exception:
+            raise ValueError(f"Invalid date format: {v!r}. Use ISO format e.g. 2026-05-01")
+        return v
+
+    @field_validator("type")
+    @classmethod
+    def validate_type(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v.strip().lower() not in ("expense", "income", "transfer"):
+            raise ValueError(f"type must be 'expense', 'income', or 'transfer', got {v!r}")
+        return v
+
+
 class PredictRequest(BaseModel):
-    transactions: List[TransactionIn]
+    transactions: List[TransactionIn] = Field(..., min_length=1)
     days: int = Field(default=30, ge=1, le=365)
-    anchor_year: Optional[int] = None
+    anchor_year: Optional[int] = Field(default=None, ge=2000, le=2100)
     anchor_month: Optional[int] = Field(default=None, ge=1, le=12)
+
 
 class PredictResponse(BaseModel):
     message: str
@@ -346,8 +519,9 @@ class PredictResponse(BaseModel):
     next_month: float
     metrics: Optional[List[Dict[str, Any]]] = None
 
+
 @app.post("/predict", response_model=PredictResponse)
-def predict(req: PredictRequest):
+def predict(req: PredictRequest) -> PredictResponse:
     df = pd.DataFrame([t.model_dump() for t in req.transactions])
     msg, next_day, next_week, next_month, metrics_list = predict_all_horizons_multi(
         df,
@@ -355,14 +529,15 @@ def predict(req: PredictRequest):
         anchor_year=req.anchor_year,
         anchor_month=req.anchor_month,
     )
-    return {
-        "message": msg,
-        "next_day": float(next_day),
-        "next_week": float(next_week),
-        "next_month": float(next_month),
-        "metrics": metrics_list
-    }
+    return PredictResponse(
+        message=msg,
+        next_day=float(next_day),
+        next_week=float(next_week),
+        next_month=float(next_month),
+        metrics=metrics_list,
+    )
+
 
 @app.get("/health")
-def health():
+def health() -> Dict[str, str]:
     return {"status": "ok"}
