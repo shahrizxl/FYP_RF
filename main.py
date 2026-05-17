@@ -753,53 +753,103 @@ class AccuracyResponse(BaseModel):
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest) -> PredictResponse:
     df = pd.DataFrame([t.model_dump() for t in req.transactions])
-    msg, next_day, next_week, next_month, metrics_list, explainability = (
-        predict_all_horizons_multi(
-            df,
-            days=req.days,
-            anchor_year=req.anchor_year,
-            anchor_month=req.anchor_month,
-        )
+
+    (
+        msg,
+        next_day,
+        next_week,
+        next_month,
+        metrics_list,
+        explainability,
+    ) = predict_all_horizons_multi(
+        df,
+        days=req.days,
+        anchor_year=req.anchor_year,
+        anchor_month=req.anchor_month,
     )
 
     pred_id = str(uuid.uuid4())
 
-    # Store prediction in history
+    # =========================================================
+    # STORE PREDICTION HISTORY
+    # =========================================================
     _prediction_history[pred_id] = {
         "prediction_id": pred_id,
+
         "period_label": (
             f"{req.anchor_year}-{req.anchor_month:02d}"
             if req.anchor_year and req.anchor_month
             else date.today().strftime("%Y-%m")
         ),
+
         "predicted": float(next_month),
-        "actual": None,
+
+        # IMPORTANT:
+        # MUST match print_accuracy_report()
+        "actual_spend": None,
+
         "method": msg,
-        "created_at": pd.Timestamp.now().isoformat(timespec="seconds"),
+
+        "created_at": pd.Timestamp.now().isoformat(
+            timespec="seconds"
+        ),
     }
 
-    # Coerce explainability dict -> Pydantic model
+    logger.info(
+        f"Stored prediction: {pred_id} | "
+        f"Predicted=RM {next_month:.2f}"
+    )
+
+    # =========================================================
+    # EXPLAINABILITY MODEL
+    # =========================================================
     expl_model: Optional[Explainability] = None
+
     if explainability:
         wi = explainability.get("weekend_influence")
+
         expl_model = Explainability(
             feature_importances=[
-                FeatureImportanceItem(**f) for f in explainability["feature_importances"]
+                FeatureImportanceItem(**f)
+                for f in explainability.get(
+                    "feature_importances", []
+                )
             ],
-            weekend_influence=WeekendInfluence(**wi) if wi else None,
+
+            weekend_influence=(
+                WeekendInfluence(**wi)
+                if wi
+                else None
+            ),
+
             category_impact=[
-                CategoryImpact(**c) for c in explainability["category_impact"]
+                CategoryImpact(**c)
+                for c in explainability.get(
+                    "category_impact", []
+                )
             ],
-            explanation_text=explainability["explanation_text"],
+
+            explanation_text=explainability.get(
+                "explanation_text", ""
+            ),
         )
 
+    # =========================================================
+    # RESPONSE
+    # =========================================================
     return PredictResponse(
         prediction_id=pred_id,
+
         message=msg,
-        next_day=float(next_day),
-        next_week=float(next_week),
-        next_month=float(next_month),
+
+        next_day=round(float(next_day), 2),
+
+        next_week=round(float(next_week), 2),
+
+        next_month=round(float(next_month), 2),
+
         metrics=metrics_list,
+
         explainability=expl_model,
     )
 
@@ -970,32 +1020,85 @@ def print_accuracy_report(history: Dict[str, Dict[str, Any]]) -> None:
 
 @app.post("/record_actual")
 def record_actual(req: RecordActualRequest) -> Dict[str, Any]:
+
+    # =========================================================
+    # FIND STORED PREDICTION
+    # =========================================================
     record = _prediction_history.get(req.prediction_id)
+
     if record is None:
-        return {"error": f"prediction_id {req.prediction_id!r} not found"}
+        logger.warning(
+            f"Prediction ID not found: {req.prediction_id}"
+        )
 
-    predicted = record["predicted"]
+        return {
+            "error": (
+                f"prediction_id "
+                f"{req.prediction_id!r} not found"
+            )
+        }
+
+    # =========================================================
+    # CALCULATE ERRORS
+    # =========================================================
+    predicted = float(record["predicted"])
+
     actual = float(req.actual_spend)
-    error = actual - predicted
-    abs_error = abs(error)
-    pct_error = (error / predicted * 100) if predicted else None
 
-    record["actual"] = actual
+    error = actual - predicted
+
+    abs_error = abs(error)
+
+    pct_error = (
+        (error / predicted) * 100
+        if predicted != 0
+        else 0.0
+    )
+
+    # =========================================================
+    # UPDATE RECORD
+    # IMPORTANT:
+    # MUST use actual_spend key
+    # =========================================================
+    record["actual_spend"] = actual
+
     record["error"] = round(error, 2)
+
     record["abs_error"] = round(abs_error, 2)
-    record["pct_error"] = round(pct_error, 1) if pct_error is not None else None
+
+    record["pct_error"] = round(pct_error, 1)
+
     if req.period_label:
         record["period_label"] = req.period_label
 
-    print_accuracy_report(_prediction_history)   # ← add this line
+    logger.info(
+        f"Recorded actual spend | "
+        f"Prediction={predicted:.2f} | "
+        f"Actual={actual:.2f}"
+    )
 
+    # =========================================================
+    # PRINT ML METRICS
+    # =========================================================
+    print_accuracy_report(_prediction_history)
+
+    # =========================================================
+    # RESPONSE
+    # =========================================================
     return {
         "prediction_id": req.prediction_id,
-        "predicted": predicted,
-        "actual": actual,
+
+        "predicted": round(predicted, 2),
+
+        "actual_spend": round(actual, 2),
+
         "error": round(error, 2),
-        "pct_error": round(pct_error, 1) if pct_error is not None else None,
-        "message": "Actual spend recorded.",
+
+        "abs_error": round(abs_error, 2),
+
+        "pct_error": round(pct_error, 1),
+
+        "message": "Actual spend recorded successfully.",
     }
 
 @app.get("/health")
