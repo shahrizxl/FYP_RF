@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, field_validator
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
+import logging
 
 # =========================
 # CONFIG
@@ -48,6 +49,8 @@ FEATURE_LABELS: Dict[str, str] = {
 # submitted later via /record_actual.
 # In production, replace with a database or persistent cache.
 _prediction_history: Dict[str, Dict[str, Any]] = {}
+logger = logging.getLogger("smartbudget")
+logging.basicConfig(level=logging.INFO)
 
 
 # =========================
@@ -801,37 +804,37 @@ def predict(req: PredictRequest) -> PredictResponse:
     )
 
 
-@app.post("/record_actual")
-def record_actual(req: RecordActualRequest) -> Dict[str, Any]:
-    """
-    Call this endpoint once the anchor period closes and you know the real spend.
-    Stores the actual alongside the prediction so /accuracy can compute error.
-    """
-    record = _prediction_history.get(req.prediction_id)
-    if record is None:
-        return {"error": f"prediction_id {req.prediction_id!r} not found"}
+# @app.post("/record_actual")
+# def record_actual(req: RecordActualRequest) -> Dict[str, Any]:
+#     """
+#     Call this endpoint once the anchor period closes and you know the real spend.
+#     Stores the actual alongside the prediction so /accuracy can compute error.
+#     """
+#     record = _prediction_history.get(req.prediction_id)
+#     if record is None:
+#         return {"error": f"prediction_id {req.prediction_id!r} not found"}
 
-    predicted = record["predicted"]
-    actual = float(req.actual_spend)
-    error = actual - predicted
-    abs_error = abs(error)
-    pct_error = (error / predicted * 100) if predicted else None
+#     predicted = record["predicted"]
+#     actual = float(req.actual_spend)
+#     error = actual - predicted
+#     abs_error = abs(error)
+#     pct_error = (error / predicted * 100) if predicted else None
 
-    record["actual"] = actual
-    record["error"] = round(error, 2)
-    record["abs_error"] = round(abs_error, 2)
-    record["pct_error"] = round(pct_error, 1) if pct_error is not None else None
-    if req.period_label:
-        record["period_label"] = req.period_label
+#     record["actual"] = actual
+#     record["error"] = round(error, 2)
+#     record["abs_error"] = round(abs_error, 2)
+#     record["pct_error"] = round(pct_error, 1) if pct_error is not None else None
+#     if req.period_label:
+#         record["period_label"] = req.period_label
 
-    return {
-        "prediction_id": req.prediction_id,
-        "predicted": predicted,
-        "actual": actual,
-        "error": round(error, 2),
-        "pct_error": round(pct_error, 1) if pct_error is not None else None,
-        "message": "Actual spend recorded.",
-    }
+#     return {
+#         "prediction_id": req.prediction_id,
+#         "predicted": predicted,
+#         "actual": actual,
+#         "error": round(error, 2),
+#         "pct_error": round(pct_error, 1) if pct_error is not None else None,
+#         "message": "Actual spend recorded.",
+#     }
 
 
 @app.get("/accuracy", response_model=AccuracyResponse)
@@ -878,6 +881,122 @@ def accuracy() -> AccuracyResponse:
         evaluated_records=len(abs_errors),
     )
 
+def print_accuracy_report(history: Dict[str, Dict[str, Any]]) -> None:
+    """
+    Print full ML evaluation metrics to terminal logs.
+    """
+
+    completed = [
+        r for r in history.values()
+        if r.get("actual_spend") is not None
+    ]
+
+    if not completed:
+        logger.info("No completed prediction evaluations yet.")
+        return
+
+    actuals = np.array(
+        [float(r["actual_spend"]) for r in completed],
+        dtype=float,
+    )
+
+    preds = np.array(
+        [float(r["predicted"]) for r in completed],
+        dtype=float,
+    )
+
+    abs_errors = np.abs(actuals - preds)
+
+    # ─────────────────────────────────────────────
+    # METRICS
+    # ─────────────────────────────────────────────
+    mae = mean_absolute_error(actuals, preds)
+
+    rmse = np.sqrt(mean_squared_error(actuals, preds))
+
+    # avoid divide-by-zero
+    nonzero_mask = actuals != 0
+
+    if nonzero_mask.any():
+        mape = (
+            np.mean(
+                np.abs(
+                    (actuals[nonzero_mask] - preds[nonzero_mask])
+                    / actuals[nonzero_mask]
+                )
+            )
+            * 100
+        )
+    else:
+        mape = 0.0
+
+    try:
+        r2 = r2_score(actuals, preds)
+    except Exception:
+        r2 = 0.0
+
+    # ─────────────────────────────────────────────
+    # TERMINAL REPORT
+    # ─────────────────────────────────────────────
+    logger.info("")
+    logger.info("============================================================")
+    logger.info(" SMARTBUDGET ML — ACCURACY REPORT ")
+    logger.info("============================================================")
+
+    for r in completed[-5:]:
+        pred = float(r["predicted"])
+        actual = float(r["actual_spend"])
+        err = actual - pred
+        pct = (err / actual * 100) if actual != 0 else 0.0
+
+        logger.info(
+            f"[{r.get('period_label', '-')}] "
+            f"Predicted=RM {pred:.2f} | "
+            f"Actual=RM {actual:.2f} | "
+            f"Error={err:+.2f} ({pct:+.1f}%)"
+        )
+
+    logger.info("------------------------------------------------------------")
+    logger.info(" AGGREGATE METRICS ")
+    logger.info("------------------------------------------------------------")
+    logger.info(f"Records Evaluated : {len(completed)}")
+    logger.info(f"MAE               : RM {mae:.2f}")
+    logger.info(f"RMSE              : RM {rmse:.2f}")
+    logger.info(f"MAPE              : {mape:.2f}%")
+    logger.info(f"R² Score          : {r2:.4f}")
+
+    logger.info("============================================================")
+    logger.info("")
+
+@app.post("/record_actual")
+def record_actual(req: RecordActualRequest) -> Dict[str, Any]:
+    record = _prediction_history.get(req.prediction_id)
+    if record is None:
+        return {"error": f"prediction_id {req.prediction_id!r} not found"}
+
+    predicted = record["predicted"]
+    actual = float(req.actual_spend)
+    error = actual - predicted
+    abs_error = abs(error)
+    pct_error = (error / predicted * 100) if predicted else None
+
+    record["actual"] = actual
+    record["error"] = round(error, 2)
+    record["abs_error"] = round(abs_error, 2)
+    record["pct_error"] = round(pct_error, 1) if pct_error is not None else None
+    if req.period_label:
+        record["period_label"] = req.period_label
+
+    print_accuracy_report(_prediction_history)   # ← add this line
+
+    return {
+        "prediction_id": req.prediction_id,
+        "predicted": predicted,
+        "actual": actual,
+        "error": round(error, 2),
+        "pct_error": round(pct_error, 1) if pct_error is not None else None,
+        "message": "Actual spend recorded.",
+    }
 
 @app.get("/health")
 def health() -> Dict[str, str]:
